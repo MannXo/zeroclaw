@@ -6,7 +6,10 @@ ZeroClaw supports LINE via the Messaging API, receiving messages through an embe
 
 {{#peer-group line}}
 
-LINE layers `dm_policy` and `group_policy` on top of the peer set, see [Access Policies](#6-access-policies) below. When a policy is set to `allowlist`, the peer set is the allowlist.
+LINE layers `dm_policy` and `group_policy` on top of one alias-wide peer set;
+see [Access Policies](#6-access-policies) below. Every enabled group policy
+requires a peer. For DMs, the peer set is enforced by `allowlist` and supplies
+the identities already accepted by `pairing`.
 
 ## Prerequisites
 
@@ -131,9 +134,12 @@ of a joined group who is not a peer cannot drive the agent.
 | `open` | The bot responds without needing a mention, still only to a peer. |
 | `disabled` | The bot ignores all group messages entirely. |
 
-To run a genuinely public room, add `"*"` to the channel's peer set as the
-explicit opt-in. Pairing is a DM handshake and is never offered in a group: a
-group member must pair over DM or be added to the peer set by the operator.
+`external_peers = ["*"]` is channel-wide, not group-scoped. It accepts every
+group or room sender and every DM sender for that LINE alias. In
+`dm_policy = "pairing"`, a non-empty peer set also means no startup pairing
+guard is issued. Use the wildcard only when both the public-room and public-DM
+effects are intended. Pairing remains a DM-only handshake and is never offered
+inside a group or room.
 
 ---
 
@@ -151,7 +157,7 @@ The maximum accepted audio size is 25 MB. Larger files are silently skipped with
 |---|---|---|
 | LINE Verify fails | ZeroClaw not running, or port not reachable | Confirm the process is up and the port is accessible from the internet |
 | Bot does not reply to DMs | `dm_policy = pairing` and user has not run `/bind` | User must send `/bind <code>` first, or switch to `dm_policy = open` |
-| Bot does not reply in groups | `group_policy = mention` and message has no @mention | @mention the bot, or switch to `group_policy = open` |
+| Bot does not reply in groups | Message has no required @mention, or the sender is absent from the peer set | @mention the bot when required and add the sender to the alias-wide peer set |
 | Reply arrives as a push message | Reply token expired (~30 s window) | Expected fallback behaviour, no action required |
 | Audio messages ignored | `[transcription]` not configured | Add `[transcription]` block with `enabled = true` |
 
@@ -162,6 +168,7 @@ The maximum accepted audio size is 25 MB. Larger files are silently skipped with
 | Startup healthy | `LINE: webhook server listening on http://0.0.0.0:<port>/line/webhook` |
 | Signature rejected | `LINE: invalid X-Line-Signature` |
 | Unauthorized DM | `LINE: DM from <userId> rejected by policy` |
+| Unauthorized group or room sender | `ignoring group message from unauthorized sender` |
 | Pairing required | `LINE: unpaired user <userId>; ignoring until /bind` |
 | Audio ignored (no transcription) | `LINE: audio message ignored (transcription not configured)` |
 | Audio transcription failed | `LINE: transcription failed for <messageId>:` |

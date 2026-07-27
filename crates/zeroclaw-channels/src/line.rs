@@ -360,6 +360,54 @@ async fn handle_webhook(
             .unwrap_or("")
             .to_string();
 
+        let source = match event.get("source") {
+            Some(source) => source,
+            None => continue,
+        };
+        let source_type = source.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let user_id = match source.get("userId").and_then(|u| u.as_str()) {
+            Some(id) => id,
+            None => continue,
+        };
+        let is_group = matches!(source_type, "group" | "room");
+
+        // Group authorization must precede content resolution: audio content
+        // download and transcription are attacker-triggered side effects.
+        if is_group {
+            match state.group_policy {
+                LineGroupPolicy::Disabled => continue,
+                LineGroupPolicy::Open => {}
+                LineGroupPolicy::Mention => {
+                    let mention_span = LineChannel::find_bot_mention(msg_obj, &state.bot_user_id);
+                    if mention_span.is_none() {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            ),
+                            &format!(
+                                "skipping group message without bot mention (userId: {})",
+                                state.bot_user_id
+                            )
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            if !is_line_user_allowed(&*state, user_id) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"user_id": user_id})),
+                    "ignoring group message from unauthorized sender. Add them to the channel peer group, or pair over DM."
+                );
+                continue;
+            }
+        }
+
         // Resolve message content: text directly, audio via transcription.
         let owned_text: String;
         let text: &str = match msg_type {
@@ -439,59 +487,6 @@ async fn handle_webhook(
             }
             _ => continue,
         };
-
-        let source = match event.get("source") {
-            Some(s) => s,
-            None => continue,
-        };
-        let source_type = source.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        let user_id = match source.get("userId").and_then(|u| u.as_str()) {
-            Some(id) => id,
-            None => continue,
-        };
-
-        let is_group = matches!(source_type, "group" | "room");
-
-        // 3. Group policy gate
-        if is_group {
-            match state.group_policy {
-                LineGroupPolicy::Disabled => continue,
-                LineGroupPolicy::Open => {}
-                LineGroupPolicy::Mention => {
-                    let mention_span = LineChannel::find_bot_mention(msg_obj, &state.bot_user_id);
-                    if mention_span.is_none() {
-                        ::zeroclaw_log::record!(
-                            DEBUG,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            ),
-                            &format!(
-                                "skipping group message without bot mention (userId: {})",
-                                state.bot_user_id
-                            )
-                        );
-                        continue;
-                    }
-                }
-            }
-
-            // `group_policy` decides whether the bot is being addressed, not who
-            // may address it. Sender authorization is required in every enabled
-            // group mode; an explicit wildcard peer is the opt-in for a public
-            // room. Pairing is deliberately not offered here, so a group sender
-            // must pair over DM or be bound by the operator first.
-            if !is_line_user_allowed(&*state, user_id) {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"user_id": user_id})),
-                    "ignoring group message from unauthorized sender. Add them to the channel peer group, or pair over DM."
-                );
-                continue;
-            }
-        }
 
         // 4. DM policy gate (non-group messages only)
         if !is_group {
@@ -1298,6 +1293,22 @@ mod tests {
         })
     }
 
+    fn room_event(
+        user_id: &str,
+        room_id: &str,
+        text: &str,
+        reply_token: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "events": [{
+                "type": "message",
+                "replyToken": reply_token,
+                "source": {"type": "room", "roomId": room_id, "userId": user_id},
+                "message": {"id": "msg-room", "type": "text", "text": text}
+            }]
+        })
+    }
+
     /// Build a group text event with a bot mention at `(index, length)`.
     fn group_mention_event(
         user_id: &str,
@@ -2023,6 +2034,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn webhook_room_open_authorizes_sender_and_routes_to_room_id() {
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            "line_test_alias",
+            resolver_from(vec!["Uroom-user".to_string()]),
+            0,
+        );
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        post_signed(
+            port,
+            "mysecret",
+            &room_event("Uroom-user", "Rroom1", "hello room", "rt1"),
+        )
+        .await;
+
+        let message = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.sender, "Uroom-user");
+        assert_eq!(message.reply_target, "Rroom1");
+        abort.abort();
+    }
+
+    #[tokio::test]
     async fn webhook_group_mention_drops_unauthorized_sender() {
         // Mentioning the bot is not authorization: `find_bot_mention` only
         // checks that the bot was named, never who named it.
@@ -2108,6 +2148,15 @@ mod tests {
 
     #[tokio::test]
     async fn webhook_group_does_not_consume_pairing_codes() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let api_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&api_server)
+            .await;
+
         // Pairing is a DM handshake. A /bind in a room must neither authorize
         // the sender nor reach the agent.
         let ch = LineChannel::new(
@@ -2118,13 +2167,16 @@ mod tests {
             "line_test_alias",
             empty_resolver(),
             0,
-        );
+        )
+        .with_api_base_url(&api_server.uri());
+        let pairing = ch.pairing.clone().expect("pairing guard");
+        let code = pairing.pairing_code().expect("pending pairing code");
         let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
 
         post_signed(
             port,
             "mysecret",
-            &group_event("Uintruder", "Ggroup1", "/bind 123456", "rt1"),
+            &group_event("Uintruder", "Ggroup1", &format!("/bind {code}"), "rt1"),
         )
         .await;
 
@@ -2132,6 +2184,83 @@ mod tests {
         assert!(
             result.is_err(),
             "a pairing code must not be redeemable from a group"
+        );
+        assert_eq!(
+            pairing.pairing_code().as_deref(),
+            Some(code.as_str()),
+            "the group attempt must leave the real code pending"
+        );
+
+        post_signed(
+            port,
+            "mysecret",
+            &dm_event("Uintruder", &format!("/bind {code}"), "rt2"),
+        )
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while pairing.pairing_code().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the same code must remain redeemable over DM");
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn unauthorized_group_audio_triggers_no_download_or_transcription() {
+        use wiremock::MockServer;
+
+        let api_server = MockServer::start().await;
+        let transcription_config = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                url: format!("{}/v1/transcribe", api_server.uri()),
+                bearer_token: Some("test-token".to_string()),
+                max_audio_bytes: 25 * 1024 * 1024,
+                timeout_secs: 300,
+            }),
+            transcribe_non_ptt_audio: true,
+            ..Default::default()
+        };
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            "line_test_alias",
+            resolver_from(vec!["Uoperator".to_string()]),
+            0,
+        )
+        .with_api_base_url(&api_server.uri())
+        .with_transcription(transcription_config);
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+        let audio_event = serde_json::json!({
+            "events": [{
+                "type": "message",
+                "replyToken": "rt1",
+                "source": {
+                    "type": "group",
+                    "groupId": "Ggroup1",
+                    "userId": "Uintruder"
+                },
+                "message": {"id": "audio-denied", "type": "audio", "duration": 3000}
+            }]
+        });
+
+        assert_eq!(post_signed(port, "mysecret", &audio_event).await, 200);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                .await
+                .is_err()
+        );
+        assert!(
+            api_server
+                .received_requests()
+                .await
+                .expect("mock request history")
+                .is_empty(),
+            "authorization must run before content fetch, transcription, or loading signals"
         );
         abort.abort();
     }
