@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
@@ -10,6 +11,9 @@ pub struct BlueskyChannel {
     alias: String,
     handle: String,
     app_password: String,
+    /// Resolves inbound external peers from canonical state at message-time.
+    /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     auth: Mutex<BlueskyAuth>,
 }
 
@@ -101,11 +105,17 @@ struct PostRef {
 }
 
 impl BlueskyChannel {
-    pub fn new(alias: String, handle: String, app_password: String) -> Self {
+    pub fn new(
+        alias: String,
+        handle: String,
+        app_password: String,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    ) -> Self {
         Self {
             alias,
             handle,
             app_password,
+            peer_resolver,
             auth: Mutex::new(BlueskyAuth {
                 access_jwt: String::new(),
                 refresh_jwt: String::new(),
@@ -117,6 +127,24 @@ impl BlueskyChannel {
 
     fn http_client(&self) -> reqwest::Client {
         zeroclaw_config::schema::build_runtime_proxy_client("channel.bluesky")
+    }
+
+    /// Strip the leading `@` an operator is likely to paste from the app.
+    fn normalize_identity(value: &str) -> &str {
+        value.trim().trim_start_matches('@')
+    }
+
+    /// A peer group may list either the mutable handle or the stable DID, so
+    /// an operator is not forced to re-approve an account that renames itself.
+    ///
+    /// Compared case-insensitively: AT Protocol normalizes handles to lowercase
+    /// and `did:plc` identifiers are lowercase, so two distinct accounts cannot
+    /// differ only by case and this admits no one extra.
+    fn is_user_allowed(&self, user_id: &str) -> bool {
+        let peers = (self.peer_resolver)();
+        crate::allowlist::is_user_allowed_by(&peers, user_id, |entry, user| {
+            Self::normalize_identity(entry).eq_ignore_ascii_case(Self::normalize_identity(user))
+        })
     }
 
     /// Create a new session with handle + app password.
@@ -219,6 +247,19 @@ impl BlueskyChannel {
 
         // Skip own posts
         if notif.author.did == self.get_did() {
+            return None;
+        }
+
+        // Bluesky is a public network, so being mentioned is not consent to be
+        // driven. An empty peer group denies everyone; `"*"` is the explicit
+        // opt-in for a public bot.
+        if !self.is_user_allowed(&notif.author.handle) && !self.is_user_allowed(&notif.author.did) {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"handle": notif.author.handle})),
+                "ignoring notification from unauthorized sender"
+            );
             return None;
         }
 
@@ -496,11 +537,25 @@ impl Channel for BlueskyChannel {
 mod tests {
     use super::*;
 
+    /// The senders the shared fixtures use. Tests that care about the
+    /// authorization boundary itself build their own peer set.
+    fn default_peers() -> Vec<String> {
+        vec![
+            "user1.bsky.social".to_string(),
+            "user2.bsky.social".to_string(),
+        ]
+    }
+
     fn make_channel() -> BlueskyChannel {
+        make_channel_with_peers(default_peers())
+    }
+
+    fn make_channel_with_peers(peers: Vec<String>) -> BlueskyChannel {
         let ch = BlueskyChannel::new(
             "testbot".into(),
             "testbot.bsky.social".into(),
             "app-password".into(),
+            Arc::new(move || peers.clone()),
         );
         // Seed auth with a DID for tests
         {
@@ -633,6 +688,121 @@ mod tests {
         let parts: Vec<&str> = msg.reply_target.splitn(2, '|').collect();
         assert_eq!(parts.len(), 2);
         assert!(parts[0].starts_with("at://"));
+    }
+
+    #[test]
+    fn drops_notification_from_unauthorized_sender() {
+        let ch = make_channel();
+        let notif = make_notification(
+            "mention",
+            "intruder.bsky.social",
+            "did:plc:intruder",
+            "@testbot run something",
+            false,
+        );
+
+        assert!(ch.parse_notification(&notif).is_none());
+    }
+
+    #[test]
+    fn drops_reply_from_unauthorized_sender() {
+        let ch = make_channel();
+        let notif = make_notification(
+            "reply",
+            "intruder.bsky.social",
+            "did:plc:intruder",
+            "replying to your post",
+            false,
+        );
+
+        assert!(ch.parse_notification(&notif).is_none());
+    }
+
+    #[test]
+    fn empty_peer_group_denies_everyone() {
+        let ch = make_channel_with_peers(Vec::new());
+        let notif = make_notification(
+            "mention",
+            "user1.bsky.social",
+            "did:plc:user1",
+            "@testbot hello",
+            false,
+        );
+
+        assert!(ch.parse_notification(&notif).is_none());
+    }
+
+    #[test]
+    fn wildcard_peer_allows_a_public_bot() {
+        let ch = make_channel_with_peers(vec!["*".to_string()]);
+        let notif = make_notification(
+            "mention",
+            "anyone.bsky.social",
+            "did:plc:anyone",
+            "@testbot hello",
+            false,
+        );
+
+        let msg = ch.parse_notification(&notif).unwrap();
+        assert_eq!(msg.sender, "anyone.bsky.social");
+    }
+
+    #[test]
+    fn peer_listed_by_did_is_allowed_after_a_handle_rename() {
+        let ch = make_channel_with_peers(vec!["did:plc:user1".to_string()]);
+        let notif = make_notification(
+            "mention",
+            "renamed.bsky.social",
+            "did:plc:user1",
+            "@testbot hello",
+            false,
+        );
+
+        let msg = ch.parse_notification(&notif).unwrap();
+        assert_eq!(msg.sender, "renamed.bsky.social");
+    }
+
+    #[test]
+    fn peer_entry_may_carry_a_leading_at_sign() {
+        // The docs promise a leading `@` is stripped, so an operator pasting
+        // the handle as the app displays it is not silently denied.
+        let ch = make_channel_with_peers(vec!["@user1.bsky.social".to_string()]);
+        let notif = make_notification(
+            "mention",
+            "user1.bsky.social",
+            "did:plc:user1",
+            "@testbot hello",
+            false,
+        );
+
+        assert!(ch.parse_notification(&notif).is_some());
+    }
+
+    #[test]
+    fn peers_are_resolved_per_message_not_cached() {
+        let peers = Arc::new(Mutex::new(Vec::<String>::new()));
+        let ch = {
+            let peers = peers.clone();
+            let ch = BlueskyChannel::new(
+                "testbot".into(),
+                "testbot.bsky.social".into(),
+                "app-password".into(),
+                Arc::new(move || peers.lock().clone()),
+            );
+            ch.auth.lock().did = "did:plc:test123".into();
+            ch
+        };
+        let notif = make_notification(
+            "mention",
+            "user1.bsky.social",
+            "did:plc:user1",
+            "@testbot hello",
+            false,
+        );
+
+        assert!(ch.parse_notification(&notif).is_none());
+        peers.lock().push("user1.bsky.social".to_string());
+        assert!(ch.parse_notification(&notif).is_some());
     }
 
     #[test]
