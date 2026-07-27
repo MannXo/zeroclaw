@@ -12,7 +12,7 @@ pub struct BlueskyChannel {
     handle: String,
     app_password: String,
     /// Resolves inbound external peers from canonical state at message-time.
-    /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
+    /// The resolver reads live configuration and is not cached.
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     auth: Mutex<BlueskyAuth>,
 }
@@ -48,6 +48,11 @@ struct RefreshSessionResponse {
 struct NotificationListResponse {
     notifications: Vec<Notification>,
     cursor: Option<String>,
+}
+
+struct NotificationPage {
+    messages: Vec<ChannelMessage>,
+    next_cursor: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -308,6 +313,39 @@ impl BlueskyChannel {
         })
     }
 
+    /// Process one newest-first notification page and decide whether polling
+    /// must continue. The seen watermark advances for every examined unread
+    /// notification, including notifications rejected by authorization.
+    fn process_notification_page(
+        &self,
+        listing: &NotificationListResponse,
+        newest_unread: &mut Option<String>,
+    ) -> NotificationPage {
+        let mut reached_read_boundary = false;
+        let mut messages = Vec::new();
+
+        for notification in &listing.notifications {
+            if notification.is_read {
+                reached_read_boundary = true;
+            } else if newest_unread.is_none() {
+                // listNotifications is newest-first, so the first unread item
+                // across the page walk is the watermark updateSeen needs.
+                *newest_unread = Some(notification.indexed_at.clone());
+            }
+
+            if let Some(message) = self.parse_notification(notification) {
+                messages.push(message);
+            }
+        }
+
+        NotificationPage {
+            messages,
+            next_cursor: (!reached_read_boundary)
+                .then(|| listing.cursor.clone())
+                .flatten(),
+        }
+    }
+
     /// Mark notifications as read up to a given timestamp.
     async fn update_seen(&self, seen_at: &str) -> Result<()> {
         let token = self.get_access_jwt().await?;
@@ -446,60 +484,96 @@ impl Channel for BlueskyChannel {
             };
 
             let client = self.http_client();
-            let resp = match client
-                .get(format!(
-                    "{BSKY_API_BASE}/app.bsky.notification.listNotifications"
-                ))
-                .bearer_auth(&token)
-                .query(&[("limit", "25")])
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "poll error"
-                    );
-                    continue;
-                }
-            };
-
-            if !resp.status().is_success() {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                    &format!("notifications failed: {}", resp.status())
-                );
-                continue;
-            }
-
-            let listing: NotificationListResponse = match resp.json().await {
-                Ok(l) => l,
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "parse error"
-                    );
-                    continue;
-                }
-            };
-
+            let mut cursor: Option<String> = None;
+            let mut seen_cursors = std::collections::HashSet::new();
             let mut latest_indexed_at: Option<String> = None;
-            for notif in &listing.notifications {
-                if let Some(msg) = self.parse_notification(notif) {
-                    latest_indexed_at = Some(notif.indexed_at.clone());
-                    if tx.send(msg).await.is_err() {
+            let mut poll_complete = false;
+
+            loop {
+                let mut query = vec![("limit", "25")];
+                if let Some(value) = cursor.as_deref() {
+                    query.push(("cursor", value));
+                }
+
+                let resp = match client
+                    .get(format!(
+                        "{BSKY_API_BASE}/app.bsky.notification.listNotifications"
+                    ))
+                    .bearer_auth(&token)
+                    .query(&query)
+                    .send()
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{error}")})),
+                            "poll error"
+                        );
+                        break;
+                    }
+                };
+
+                if !resp.status().is_success() {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!("notifications failed: {}", resp.status())
+                    );
+                    break;
+                }
+
+                let listing: NotificationListResponse = match resp.json().await {
+                    Ok(listing) => listing,
+                    Err(error) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{error}")})),
+                            "parse error"
+                        );
+                        break;
+                    }
+                };
+
+                let page = self.process_notification_page(&listing, &mut latest_indexed_at);
+                for message in page.messages {
+                    if tx.send(message).await.is_err() {
                         return Ok(());
                     }
                 }
+
+                let Some(next_cursor) = page.next_cursor else {
+                    poll_complete = true;
+                    break;
+                };
+                if !seen_cursors.insert(next_cursor.clone()) {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        "notification pagination returned a repeated cursor"
+                    );
+                    break;
+                }
+                cursor = Some(next_cursor);
+            }
+
+            // Do not advance past messages on an unexamined page after a
+            // partial fetch failure. They will be retried on the next poll.
+            if !poll_complete {
+                continue;
             }
 
             // Mark as seen
@@ -514,8 +588,6 @@ impl Channel for BlueskyChannel {
                     "updateSeen error"
                 );
             }
-
-            let _ = &listing.cursor; // cursor available for pagination if needed
         }
     }
 
@@ -543,6 +615,7 @@ mod tests {
         vec![
             "user1.bsky.social".to_string(),
             "user2.bsky.social".to_string(),
+            "did:plc:test123".to_string(),
         ]
     }
 
@@ -647,6 +720,49 @@ mod tests {
         );
 
         assert!(ch.parse_notification(&notif).is_none());
+    }
+
+    #[test]
+    fn denied_full_page_does_not_starve_authorized_notification_behind_it() {
+        let ch = make_channel_with_peers(vec!["allowed.bsky.social".to_string()]);
+        let first_page = NotificationListResponse {
+            notifications: (0..25)
+                .map(|index| {
+                    make_notification(
+                        "mention",
+                        &format!("denied{index}.bsky.social"),
+                        &format!("did:plc:denied{index}"),
+                        "@testbot denied",
+                        false,
+                    )
+                })
+                .collect(),
+            cursor: Some("second-page".to_string()),
+        };
+        let second_page = NotificationListResponse {
+            notifications: vec![make_notification(
+                "mention",
+                "allowed.bsky.social",
+                "did:plc:allowed",
+                "@testbot authorized",
+                false,
+            )],
+            cursor: None,
+        };
+        let mut newest_unread = None;
+
+        let first = ch.process_notification_page(&first_page, &mut newest_unread);
+        assert!(first.messages.is_empty());
+        assert_eq!(first.next_cursor.as_deref(), Some("second-page"));
+        assert!(
+            newest_unread.is_some(),
+            "denied notifications must still advance the eventual seen watermark"
+        );
+
+        let second = ch.process_notification_page(&second_page, &mut newest_unread);
+        assert_eq!(second.messages.len(), 1);
+        assert_eq!(second.messages[0].sender, "allowed.bsky.social");
+        assert!(second.next_cursor.is_none());
     }
 
     #[test]

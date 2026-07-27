@@ -6,8 +6,9 @@ inbound gate for chat channels and the routing primitive for cross-agent
 dispatch. In config it lives at `[peer_groups.<name>]`. For how peer groups fit
 into an agent's wiring, see [Agents](../agents/overview.md).
 
-Inbound senders are gated against the **peer set** resolved for the bound
-agent, drawn from every `[peer_groups.<name>]` block the agent belongs to.
+Inbound senders are gated against the **peer set** resolved for the channel
+instance, drawn from every `[peer_groups.<name>]` block whose `channel` matches
+either the channel type or its dotted alias.
 Matching strips a leading `@` and is case-insensitive against the channel's
 native sender identifier. An **empty** set denies everyone; a set containing
 `"*"` accepts anyone; otherwise only the listed `external_peers` (and peer
@@ -30,11 +31,15 @@ A `[peer_groups.<name>]` block carries:
 
 ## Resolution
 
-For a given agent, the runtime walks every group the agent appears in, unions
-the other members' aliases (as agent peers) and the group's `external_peers` on
-the group's channel, then subtracts the `ignore` list. The agent's own alias is
-removed defensively to avoid a self-loop. An agent on no peer group runs solo
-with no cross-agent dispatch.
+External sender authorization is channel-scoped: the runtime unions
+`external_peers` from every group matching the channel type or dotted alias,
+then subtracts every matching group's `ignore` list.
+
+Cross-agent routing is agent-scoped: for a given agent, the runtime walks every
+group the agent appears in, unions the other members' aliases on the group's
+channel, then subtracts `ignore`. The agent's own alias is removed defensively
+to avoid a self-loop. An agent on no peer group runs solo with no cross-agent
+dispatch.
 
 The sender identifier each channel matches against differs by platform (a
 Telegram user ID, a Matrix `@user:server`, an E.164 number, a UUID, …). Each

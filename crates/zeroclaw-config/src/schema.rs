@@ -18115,19 +18115,26 @@ impl Config {
     /// that type) or matches the full dotted `"<channel_type>.<alias>"`
     /// (instance-scoped group, applies to that one alias only).
     pub fn channel_external_peers(&self, channel_type: &str, alias: &str) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for group in self.peer_groups.values() {
-            let group_matches = match group.channel.split_once('.') {
+        let matching_groups: Vec<_> = self
+            .peer_groups
+            .values()
+            .filter(|group| match group.channel.split_once('.') {
                 Some((ty, al)) => ty == channel_type && al == alias,
                 None => group.channel == channel_type,
-            };
-            if !group_matches {
-                continue;
-            }
+            })
+            .collect();
+        let ignored: std::collections::HashSet<String> = matching_groups
+            .iter()
+            .flat_map(|group| &group.ignore)
+            .map(|peer| peer.as_str().trim_start_matches('@').to_lowercase())
+            .collect();
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for group in matching_groups {
             for peer in &group.external_peers {
                 let username = peer.as_str().to_string();
-                if seen.insert(username.clone()) {
+                let normalized = username.trim_start_matches('@').to_lowercase();
+                if !ignored.contains(&normalized) && seen.insert(normalized) {
                     out.push(username);
                 }
             }
@@ -22490,6 +22497,39 @@ impl HasPropKind for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    #[::core::prelude::v1::test]
+    fn channel_external_peers_subtracts_ignored_peers_across_matching_groups() {
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.reddit_all]
+            channel = "reddit"
+            external_peers = ["alice", "@BlockedUser"]
+
+            [peer_groups.reddit_ops]
+            channel = "reddit.ops"
+            external_peers = ["bob"]
+            ignore = ["blockeduser", "bob"]
+
+            [peer_groups.reddit_other]
+            channel = "reddit.other"
+            external_peers = ["mallory"]
+            ignore = ["alice"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        assert_eq!(
+            config.channel_external_peers("reddit", "ops"),
+            vec!["alice".to_string()]
+        );
+
+        let mut other = config.channel_external_peers("reddit", "other");
+        other.sort();
+        assert_eq!(
+            other,
+            vec!["@BlockedUser".to_string(), "mallory".to_string()]
+        );
+    }
 
     #[::core::prelude::v1::test]
     fn todotracker_config_defaults() {

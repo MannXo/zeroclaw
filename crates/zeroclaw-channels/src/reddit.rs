@@ -20,7 +20,7 @@ pub struct RedditChannel {
     /// bound to. Used for attribution and peer-group resolution.
     alias: String,
     /// Resolves inbound external peers from canonical state at message-time.
-    /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
+    /// The resolver reads live configuration and is not cached.
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     auth: Mutex<RedditAuth>,
 }
