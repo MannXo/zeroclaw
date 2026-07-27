@@ -2375,7 +2375,7 @@ mod tests {
     /// `session/new` is. `scripts/ci/parallel_runtime_test_gate.sh` runs the
     /// suite at 16 threads, where the previous 2s budget stopped being a
     /// deadlock guard and became a scheduling assertion: a loaded runner blew
-    /// it while the behaviour under test was correct (#9429).
+    /// it while the behaviour under test was correct.
     ///
     /// The operations guarded here are sub-second when they are not hung, so
     /// 30s cannot be reached by ordinary contention. It also stays well under

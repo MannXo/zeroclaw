@@ -11600,7 +11600,7 @@ mod tests {
     /// These guards exist to fail a genuine hang, not to assert how fast
     /// assembly is. `scripts/ci/parallel_runtime_test_gate.sh` runs the suite
     /// at 16 threads; under that contention the previous budgets stopped being
-    /// deadlock guards and became scheduling assertions (#9429). Assembly is
+    /// deadlock guards and became scheduling assertions. Assembly is
     /// sub-second when it is not hung, so 30s cannot be reached by ordinary
     /// runner load.
     const ASSEMBLY_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(30);
