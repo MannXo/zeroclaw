@@ -408,6 +408,24 @@ async fn handle_webhook(
             }
         }
 
+        // The DM gate below runs after content resolution because `pairing`
+        // needs the text of a `/bind`. Nothing but text can carry one, so a
+        // non-text DM from an unauthorized sender is dropped here rather than
+        // being downloaded and transcribed first.
+        if !is_group
+            && msg_type != "text"
+            && !matches!(state.dm_policy, LineDmPolicy::Open)
+            && !is_line_user_allowed(&*state, user_id)
+        {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"user_id": user_id})),
+                "skipping non-text DM from unauthorized sender before content retrieval"
+            );
+            continue;
+        }
+
         // Resolve message content: text directly, audio via transcription.
         let owned_text: String;
         let text: &str = match msg_type {
@@ -2262,6 +2280,126 @@ mod tests {
                 .is_empty(),
             "authorization must run before content fetch, transcription, or loading signals"
         );
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn unauthorized_dm_audio_triggers_no_download_or_transcription() {
+        use wiremock::MockServer;
+
+        let api_server = MockServer::start().await;
+        let transcription_config = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                url: format!("{}/v1/transcribe", api_server.uri()),
+                bearer_token: Some("test-token".to_string()),
+                max_audio_bytes: 25 * 1024 * 1024,
+                timeout_secs: 300,
+            }),
+            transcribe_non_ptt_audio: true,
+            ..Default::default()
+        };
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Allowlist,
+            LineGroupPolicy::Open,
+            "line_test_alias",
+            resolver_from(vec!["Uoperator".to_string()]),
+            0,
+        )
+        .with_api_base_url(&api_server.uri())
+        .with_transcription(transcription_config);
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+        let audio_event = serde_json::json!({
+            "events": [{
+                "type": "message",
+                "replyToken": "rt1",
+                "source": {"type": "user", "userId": "Uintruder"},
+                "message": {"id": "audio-denied", "type": "audio", "duration": 3000}
+            }]
+        });
+
+        assert_eq!(post_signed(port, "mysecret", &audio_event).await, 200);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                .await
+                .is_err()
+        );
+        assert!(
+            api_server
+                .received_requests()
+                .await
+                .expect("mock request history")
+                .is_empty(),
+            "an unauthorized DM must not reach content fetch or transcription"
+        );
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn authorized_group_audio_is_still_transcribed() {
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let api_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/v2/bot/message/.*/content"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header("content-type", "audio/x-m4a")
+                    .set_body_bytes(b"fake-audio-bytes"),
+            )
+            .mount(&api_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "transcript"})),
+            )
+            .mount(&api_server)
+            .await;
+
+        let transcription_config = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                url: format!("{}/v1/transcribe", api_server.uri()),
+                bearer_token: Some("test-token".to_string()),
+                max_audio_bytes: 25 * 1024 * 1024,
+                timeout_secs: 300,
+            }),
+            transcribe_non_ptt_audio: true,
+            ..Default::default()
+        };
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            "line_test_alias",
+            resolver_from(vec!["Uoperator".to_string()]),
+            0,
+        )
+        .with_api_base_url(&api_server.uri())
+        .with_transcription(transcription_config);
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+        let audio_event = serde_json::json!({
+            "events": [{
+                "type": "message",
+                "replyToken": "rt1",
+                "source": {"type": "group", "groupId": "Ggroup1", "userId": "Uoperator"},
+                "message": {"id": "audio-ok", "type": "audio", "duration": 3000}
+            }]
+        });
+
+        post_signed(port, "mysecret", &audio_event).await;
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for transcribed message")
+            .expect("channel closed");
+        assert_eq!(msg.content, "transcript");
+        assert_eq!(msg.sender, "Uoperator");
         abort.abort();
     }
 
