@@ -121,11 +121,19 @@ LINE: webhook server listening on http://0.0.0.0:8443/line/webhook
 
 ### Group / multi-person chat: `group_policy`
 
+`group_policy` decides when the bot is being addressed, not who may address it.
+Every enabled mode also requires the sender to be in the peer set, so a member
+of a joined group who is not a peer cannot drive the agent.
+
 | Value | Behaviour |
 |---|---|
-| `mention` (default) | The bot responds only when explicitly @mentioned. |
-| `open` | The bot responds to every message in the group. |
+| `mention` (default) | The bot responds only when explicitly @mentioned, and only to a peer. |
+| `open` | The bot responds without needing a mention, still only to a peer. |
 | `disabled` | The bot ignores all group messages entirely. |
+
+To run a genuinely public room, add `"*"` to the channel's peer set as the
+explicit opt-in. Pairing is a DM handshake and is never offered in a group: a
+group member must pair over DM or be added to the peer set by the operator.
 
 ---
 

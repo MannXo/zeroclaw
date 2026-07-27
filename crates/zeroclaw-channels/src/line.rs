@@ -475,6 +475,22 @@ async fn handle_webhook(
                     }
                 }
             }
+
+            // `group_policy` decides whether the bot is being addressed, not who
+            // may address it. Sender authorization is required in every enabled
+            // group mode; an explicit wildcard peer is the opt-in for a public
+            // room. Pairing is deliberately not offered here, so a group sender
+            // must pair over DM or be bound by the operator first.
+            if !is_line_user_allowed(&*state, user_id) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"user_id": user_id})),
+                    "ignoring group message from unauthorized sender. Add them to the channel peer group, or pair over DM."
+                );
+                continue;
+            }
         }
 
         // 4. DM policy gate (non-group messages only)
@@ -1948,14 +1964,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webhook_group_open_forwards_any_message() {
+    async fn webhook_group_open_forwards_message_from_authorized_sender() {
         let ch = LineChannel::new(
             "tok".into(),
             "mysecret".into(),
             LineDmPolicy::Open,
             LineGroupPolicy::Open,
             "line_test_alias",
-            empty_resolver(),
+            resolver_from(vec!["Uuser".to_string()]),
             0,
         );
         let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
@@ -1973,6 +1989,150 @@ mod tests {
             .unwrap();
         assert_eq!(msg.content, "anyone home?");
         assert_eq!(msg.reply_target, "Ggroup1");
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_group_open_drops_unauthorized_sender() {
+        // `group_policy = open` means no mention is required, not that any
+        // member of a joined room may drive the agent.
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            "line_test_alias",
+            resolver_from(vec!["Uoperator".to_string()]),
+            0,
+        );
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        post_signed(
+            port,
+            "mysecret",
+            &group_event("Uintruder", "Ggroup1", "run something", "rt1"),
+        )
+        .await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "group message from a sender outside the peer group must be dropped"
+        );
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_group_mention_drops_unauthorized_sender() {
+        // Mentioning the bot is not authorization: `find_bot_mention` only
+        // checks that the bot was named, never who named it.
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Mention,
+            "line_test_alias",
+            resolver_from(vec!["Uoperator".to_string()]),
+            0,
+        );
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot123").await;
+
+        let payload =
+            group_mention_event("Uintruder", "Ggrp", "@Bot help me", "Ubot123", 0, 4, "rt1");
+        post_signed(port, "mysecret", &payload).await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "mentioning the bot must not authorize an unlisted sender"
+        );
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_group_empty_peer_group_denies_everyone() {
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            "line_test_alias",
+            empty_resolver(),
+            0,
+        );
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        post_signed(
+            port,
+            "mysecret",
+            &group_event("Uanyone", "Ggroup1", "hello", "rt1"),
+        )
+        .await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "an unconfigured peer group must fail closed, not open"
+        );
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_group_wildcard_peer_allows_public_room() {
+        // The documented opt-in for a genuinely public room.
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            "line_test_alias",
+            resolver_from(vec!["*".to_string()]),
+            0,
+        );
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        post_signed(
+            port,
+            "mysecret",
+            &group_event("Uanyone", "Ggroup1", "hello", "rt1"),
+        )
+        .await;
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(msg.content, "hello");
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_group_does_not_consume_pairing_codes() {
+        // Pairing is a DM handshake. A /bind in a room must neither authorize
+        // the sender nor reach the agent.
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Pairing,
+            LineGroupPolicy::Open,
+            "line_test_alias",
+            empty_resolver(),
+            0,
+        );
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        post_signed(
+            port,
+            "mysecret",
+            &group_event("Uintruder", "Ggroup1", "/bind 123456", "rt1"),
+        )
+        .await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "a pairing code must not be redeemable from a group"
+        );
         abort.abort();
     }
 
@@ -2013,7 +2173,7 @@ mod tests {
             LineDmPolicy::Open,
             LineGroupPolicy::Mention,
             "line_test_alias",
-            empty_resolver(),
+            resolver_from(vec!["Uuser".to_string()]),
             0,
         );
         let (port, mut rx, abort) = spawn_webhook(ch, "Ubot123").await;
@@ -2501,7 +2661,7 @@ mod tests {
             LineDmPolicy::Open,
             LineGroupPolicy::Open,
             "line_test_alias",
-            empty_resolver(),
+            resolver_from(vec!["Uuser".to_string()]),
             0,
         )
         .with_api_base_url(&api_server.uri());
