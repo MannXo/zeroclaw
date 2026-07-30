@@ -152,6 +152,16 @@ impl BlueskyChannel {
         })
     }
 
+    /// Whether an `ignore` entry names this identifier, regardless of any
+    /// grant. An account is reachable by handle or DID, so a deny on one must
+    /// not be defeated by a grant matched through the other.
+    fn is_user_denied(&self, user_id: &str) -> bool {
+        let peers = (self.peer_resolver)();
+        crate::allowlist::is_user_denied_by(&peers, user_id, |entry, user| {
+            Self::normalize_identity(entry).eq_ignore_ascii_case(Self::normalize_identity(user))
+        })
+    }
+
     /// Create a new session with handle + app password.
     async fn create_session(&self) -> Result<()> {
         let client = self.http_client();
@@ -258,7 +268,17 @@ impl BlueskyChannel {
         // Bluesky is a public network, so being mentioned is not consent to be
         // driven. An empty peer group denies everyone; `"*"` is the explicit
         // opt-in for a public bot.
-        if !self.is_user_allowed(&notif.author.handle) && !self.is_user_allowed(&notif.author.did) {
+        //
+        // Either identifier may carry the grant, so the deny has to be checked
+        // across both before the grants are: an operator who ignores the handle
+        // would otherwise still be overridden by a wildcard reached through the
+        // DID, and vice versa.
+        let denied =
+            self.is_user_denied(&notif.author.handle) || self.is_user_denied(&notif.author.did);
+        if denied
+            || (!self.is_user_allowed(&notif.author.handle)
+                && !self.is_user_allowed(&notif.author.did))
+        {
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -861,6 +881,65 @@ mod tests {
 
         let msg = ch.parse_notification(&notif).unwrap();
         assert_eq!(msg.sender, "anyone.bsky.social");
+    }
+
+    #[test]
+    fn ignored_peer_is_denied_under_a_wildcard_grant() {
+        // The list shape `Config::channel_external_peers` produces when one
+        // matching group grants `["*"]` and another ignores a sender.
+        let ch = make_channel_with_peers(vec!["*".to_string(), "!alice.bsky.social".to_string()]);
+
+        let denied = make_notification(
+            "mention",
+            "alice.bsky.social",
+            "did:plc:alice",
+            "@testbot hello",
+            false,
+        );
+        assert!(
+            ch.parse_notification(&denied).is_none(),
+            "an ignored sender must not ride the wildcard"
+        );
+
+        let allowed = make_notification(
+            "mention",
+            "bob.bsky.social",
+            "did:plc:bob",
+            "@testbot hello",
+            false,
+        );
+        assert_eq!(
+            ch.parse_notification(&allowed)
+                .expect("an unignored sender still rides the wildcard")
+                .sender,
+            "bob.bsky.social"
+        );
+    }
+
+    #[test]
+    fn ignoring_one_identifier_denies_the_account_through_the_other() {
+        // An account is reachable by handle or DID and either may carry the
+        // grant, so ignoring one identifier must not leave the wildcard
+        // reachable through the other.
+        let by_handle =
+            make_channel_with_peers(vec!["*".to_string(), "!alice.bsky.social".to_string()]);
+        let by_did = make_channel_with_peers(vec!["*".to_string(), "!did:plc:alice".to_string()]);
+        let notif = make_notification(
+            "mention",
+            "alice.bsky.social",
+            "did:plc:alice",
+            "@testbot hello",
+            false,
+        );
+
+        assert!(
+            by_handle.parse_notification(&notif).is_none(),
+            "handle deny must not be defeated by a wildcard reached via the DID"
+        );
+        assert!(
+            by_did.parse_notification(&notif).is_none(),
+            "DID deny must not be defeated by a wildcard reached via the handle"
+        );
     }
 
     #[test]

@@ -18130,7 +18130,7 @@ impl Config {
             .collect();
         let mut out: Vec<String> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for group in matching_groups {
+        for group in &matching_groups {
             for peer in &group.external_peers {
                 let username = peer.as_str().to_string();
                 let normalized = username.trim_start_matches('@').to_lowercase();
@@ -18138,6 +18138,23 @@ impl Config {
                     out.push(username);
                 }
             }
+        }
+        // A wildcard grant leaves no explicit entry to subtract, so honouring
+        // `ignore` by subtraction alone would drop the deny and admit everyone.
+        // Carry each deny forward as a `!name` marker, which the channel
+        // allowlist applies ahead of the wildcard. Emitted as the operator
+        // wrote it, so a deny matches exactly what the same string would have
+        // granted. Sorted for a deterministic result.
+        if out.iter().any(|peer| peer == "*") {
+            let mut denied: Vec<String> = matching_groups
+                .iter()
+                .flat_map(|group| &group.ignore)
+                .map(|peer| peer.as_str().to_string())
+                .filter(|peer| peer.trim() != "*")
+                .collect();
+            denied.sort();
+            denied.dedup();
+            out.extend(denied.into_iter().map(|peer| format!("!{peer}")));
         }
         out
     }
@@ -22529,6 +22546,58 @@ mod tests {
             other,
             vec!["@BlockedUser".to_string(), "mallory".to_string()]
         );
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_external_peers_carries_ignore_past_a_wildcard_grant() {
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.bluesky_all]
+            channel = "bluesky"
+            external_peers = ["*"]
+
+            [peer_groups.bluesky_ops]
+            channel = "bluesky.ops"
+            ignore = ["alice.bsky.social", "@Mallory"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        // The wildcard survives, so the deny cannot be applied by subtraction.
+        // It has to travel with the list for the channel matcher to enforce.
+        assert_eq!(
+            config.channel_external_peers("bluesky", "ops"),
+            vec![
+                "*".to_string(),
+                "!@Mallory".to_string(),
+                "!alice.bsky.social".to_string(),
+            ]
+        );
+
+        // An alias the instance-scoped ignore does not match keeps the bare
+        // wildcard, so the marker is not leaked to unrelated instances.
+        assert_eq!(
+            config.channel_external_peers("bluesky", "other"),
+            vec!["*".to_string()]
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_external_peers_ignoring_the_wildcard_denies_everyone() {
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.reddit_all]
+            channel = "reddit"
+            external_peers = ["*"]
+            ignore = ["*"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        // Subtraction already removes the wildcard itself, which denies
+        // everyone. No marker is emitted, because there is nothing left to
+        // override.
+        assert!(config.channel_external_peers("reddit", "ops").is_empty());
     }
 
     #[::core::prelude::v1::test]

@@ -665,6 +665,34 @@ mod tests {
     }
 
     #[test]
+    fn ignored_peer_is_denied_under_a_wildcard_grant() {
+        // The list shape `Config::channel_external_peers` produces when one
+        // matching group grants `["*"]` and another ignores a sender.
+        let ch = make_channel_with(Vec::new(), vec!["*".to_string(), "!alice".to_string()]);
+
+        assert!(
+            ch.parse_item(&dm_from("alice")).is_none(),
+            "an ignored sender must not ride the wildcard"
+        );
+        assert_eq!(
+            ch.parse_item(&dm_from("bob"))
+                .expect("an unignored sender still rides the wildcard")
+                .sender,
+            "bob"
+        );
+    }
+
+    #[test]
+    fn ignored_peer_is_denied_regardless_of_username_case() {
+        // Reddit usernames are unique case-insensitively, so a deny written in
+        // one case has to cover the account in any case.
+        let ch = make_channel_with(Vec::new(), vec!["*".to_string(), "!Alice".to_string()]);
+
+        assert!(ch.parse_item(&dm_from("alice")).is_none());
+        assert!(ch.parse_item(&dm_from("ALICE")).is_none());
+    }
+
+    #[test]
     fn peer_match_ignores_username_case() {
         // Reddit usernames are unique case-insensitively, so `User1` and
         // `user1` are the same account rather than two.

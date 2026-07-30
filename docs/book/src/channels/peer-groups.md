@@ -25,7 +25,7 @@ A `[peer_groups.<name>]` block carries:
 | `channel` | A channel type (`"telegram"`, applies to every alias of that type) or a dotted alias (`"telegram.work"`, scopes to that one instance). |
 | `agents` | Member agents by alias. Two agents are peers only when both appear in the same group; membership is mutual. |
 | `external_peers` | Non-agent members by the channel's native username/ID. `["*"]` accepts anyone; empty accepts no one. |
-| `ignore` | Per-group blocklist; subtracts from the resolved peer set. |
+| `ignore` | Per-group blocklist; subtracts from the resolved peer set, and overrides a wildcard grant. |
 | `output_modality` | Preferred reply modality for the group: `mirror` (input-driven, default), `voice` (always reply and deliver proactive messages as TTS notes on audio-capable channels), or `text` (always text). |
 | `admin_for_agent_scope` | When `true`, the group's `external_peers` are authorized to issue `/model --agent <model>` on the bound agent. Default `false` (deny-by-default). See [Admin agent-scope authorization](#admin-agent-scope-authorization). |
 
@@ -34,6 +34,20 @@ A `[peer_groups.<name>]` block carries:
 External sender authorization is channel-scoped: the runtime unions
 `external_peers` from every group matching the channel type or dotted alias,
 then subtracts every matching group's `ignore` list.
+
+`ignore` wins over a wildcard. With `external_peers = ["*"]` on one matching
+group and `ignore = ["alice"]` on another, everyone except `alice` is
+authorized: there is no explicit entry to subtract, so the deny is carried to
+the channel as a reserved `!alice` entry and applied before the wildcard. A
+deny matches whatever the same string would have granted on that channel, and
+additionally ignores case and a leading `@`, because a blocklist should err
+toward denying. On a channel that accepts several identifiers for one account
+(Bluesky takes a handle or a DID), ignoring any one of them denies the account.
+
+`!` is therefore reserved as the first character of an `external_peers` or
+`ignore` entry. No supported platform issues usernames beginning with `!`, and
+such an entry is read as a deny rather than a grant, so the reservation cannot
+widen access.
 
 Cross-agent routing is agent-scoped: for a given agent, the runtime walks every
 group the agent appears in, unions the other members' aliases on the group's
