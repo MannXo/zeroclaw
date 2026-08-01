@@ -49,6 +49,16 @@ toward denying. On a channel that accepts several identifiers for one account
 such an entry is read as a deny rather than a grant, so the reservation cannot
 widen access.
 
+A channel written more than one way in `channel` (WeCom WebSocket answers to
+both `wecom-ws` and `wecom_ws`) resolves as one set. Resolving each spelling on
+its own and joining the results would leave a wildcard under one spelling and an
+`ignore` under the other unaware of each other.
+
+Because the deny travels inside the resolved list, a channel authorizes a sender
+through `allowlist::is_user_allowed`, `is_user_allowed_by` or, where a sender has
+several identifiers, `is_identity_allowed`. Testing the list for `"*"` directly,
+or asking one identifier at a time, admits a sender the operator ignored.
+
 Cross-agent routing is agent-scoped: for a given agent, the runtime walks every
 group the agent appears in, unions the other members' aliases on the group's
 channel, then subtracts `ignore`. The agent's own alias is removed defensively

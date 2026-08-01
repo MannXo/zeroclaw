@@ -145,19 +145,13 @@ impl BlueskyChannel {
     /// Compared case-insensitively: AT Protocol normalizes handles to lowercase
     /// and `did:plc` identifiers are lowercase, so two distinct accounts cannot
     /// differ only by case and this admits no one extra.
-    fn is_user_allowed(&self, user_id: &str) -> bool {
+    /// An account is reachable by handle or DID, so both are evaluated against
+    /// one snapshot of the peer list: a deny on either identifier rejects the
+    /// account, and resolving once means a config reload cannot land between
+    /// the two checks.
+    fn is_author_allowed(&self, handle: &str, did: &str) -> bool {
         let peers = (self.peer_resolver)();
-        crate::allowlist::is_user_allowed_by(&peers, user_id, |entry, user| {
-            Self::normalize_identity(entry).eq_ignore_ascii_case(Self::normalize_identity(user))
-        })
-    }
-
-    /// Whether an `ignore` entry names this identifier, regardless of any
-    /// grant. An account is reachable by handle or DID, so a deny on one must
-    /// not be defeated by a grant matched through the other.
-    fn is_user_denied(&self, user_id: &str) -> bool {
-        let peers = (self.peer_resolver)();
-        crate::allowlist::is_user_denied_by(&peers, user_id, |entry, user| {
+        crate::allowlist::is_identity_allowed_by(&peers, &[handle, did], |entry, user| {
             Self::normalize_identity(entry).eq_ignore_ascii_case(Self::normalize_identity(user))
         })
     }
@@ -273,12 +267,7 @@ impl BlueskyChannel {
         // across both before the grants are: an operator who ignores the handle
         // would otherwise still be overridden by a wildcard reached through the
         // DID, and vice versa.
-        let denied =
-            self.is_user_denied(&notif.author.handle) || self.is_user_denied(&notif.author.did);
-        if denied
-            || (!self.is_user_allowed(&notif.author.handle)
-                && !self.is_user_allowed(&notif.author.did))
-        {
+        if !self.is_author_allowed(&notif.author.handle, &notif.author.did) {
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)

@@ -260,21 +260,33 @@ impl WhatsAppWebChannel {
 
     #[cfg(feature = "whatsapp-web")]
     fn is_number_allowed_for_list(allowed_numbers: &[String], phone: &str) -> bool {
+        Self::are_numbers_allowed_for_list(allowed_numbers, &[phone])
+    }
+
+    /// One sender reaches this channel under several numbers (its JID, the
+    /// alternate JID and the LID mapping), so they are evaluated as one
+    /// account: a deny naming any of them rejects the sender, whichever number
+    /// would otherwise have carried the grant.
+    #[cfg(feature = "whatsapp-web")]
+    fn are_numbers_allowed_for_list(allowed_numbers: &[String], phones: &[&str]) -> bool {
+        let matches = |entry: &str, phone: &str| match (
+            Self::normalize_phone_token(entry),
+            Self::normalize_phone_token(phone),
+        ) {
+            (Some(entry_norm), Some(phone_norm)) => entry_norm == phone_norm,
+            _ => false,
+        };
         // This channel historically accepted a surrounding-whitespace wildcard
         // (`entry.trim() == "*"`), which is broader than the shared helper's
-        // exact `"*"` check, so keep that pre-check here.
+        // exact `"*"` check, so keep that pre-check here. It runs after the
+        // deny check, so it cannot admit a sender the operator ignored.
+        if crate::allowlist::is_identity_denied_by(allowed_numbers, phones, matches) {
+            return false;
+        }
         if allowed_numbers.iter().any(|entry| entry.trim() == "*") {
             return true;
         }
-        crate::allowlist::is_user_allowed_by(allowed_numbers, phone, |entry, phone| {
-            match (
-                Self::normalize_phone_token(entry),
-                Self::normalize_phone_token(phone),
-            ) {
-                (Some(entry_norm), Some(phone_norm)) => entry_norm == phone_norm,
-                _ => false,
-            }
-        })
+        crate::allowlist::is_identity_allowed_by(allowed_numbers, phones, matches)
     }
 
     /// Normalize a phone-like token to canonical E.164 (`+<digits>`).
@@ -2008,12 +2020,28 @@ impl Channel for WhatsAppWebChannel {
                                 );
 
                                 let allowed_peers = peer_resolver();
-                                let normalized = sender_candidates
-                                    .iter()
-                                    .find(|candidate| {
-                                        Self::is_number_allowed_for_list(&allowed_peers, candidate)
-                                    })
-                                    .cloned();
+                                let candidate_refs: Vec<&str> =
+                                    sender_candidates.iter().map(String::as_str).collect();
+                                // Authorize the sender as one account first, so
+                                // a deny naming any of its numbers is not
+                                // sidestepped by another number of the same
+                                // sender.
+                                let normalized = if Self::are_numbers_allowed_for_list(
+                                    &allowed_peers,
+                                    &candidate_refs,
+                                ) {
+                                    sender_candidates
+                                        .iter()
+                                        .find(|candidate| {
+                                            Self::is_number_allowed_for_list(
+                                                &allowed_peers,
+                                                candidate,
+                                            )
+                                        })
+                                        .cloned()
+                                } else {
+                                    None
+                                };
 
                                 let is_group = info.source.is_group;
                                 let reply_target = Self::compute_reply_target(&chat);
@@ -3001,6 +3029,39 @@ mod tests {
         );
         assert!(ch.is_number_allowed("+1234567890"));
         assert!(ch.is_number_allowed("+9999999999"));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_deny_survives_the_whitespace_wildcard() {
+        // The channel's own wildcard pre-check is broader than the shared
+        // one, so it has to run after the deny rather than instead of it.
+        let peers = vec![" * ".to_string(), "!+15551234567".to_string()];
+        assert!(!WhatsAppWebChannel::is_number_allowed_for_list(
+            &peers,
+            "+15551234567"
+        ));
+        assert!(WhatsAppWebChannel::is_number_allowed_for_list(
+            &peers,
+            "+15559999999"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_deny_on_one_sender_number_covers_the_others() {
+        // A sender arrives as several numbers (JID, alternate JID, LID
+        // mapping). Denying one of them must reject the sender rather than
+        // letting the next number pick up the wildcard.
+        let peers = vec!["*".to_string(), "!+15551234567".to_string()];
+        assert!(!WhatsAppWebChannel::are_numbers_allowed_for_list(
+            &peers,
+            &["+447700900000", "+15551234567"]
+        ));
+        assert!(WhatsAppWebChannel::are_numbers_allowed_for_list(
+            &peers,
+            &["+447700900000", "+15559999999"]
+        ));
     }
 
     #[test]

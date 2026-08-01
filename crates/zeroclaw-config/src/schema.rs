@@ -18115,12 +18115,24 @@ impl Config {
     /// that type) or matches the full dotted `"<channel_type>.<alias>"`
     /// (instance-scoped group, applies to that one alias only).
     pub fn channel_external_peers(&self, channel_type: &str, alias: &str) -> Vec<String> {
+        self.channel_external_peers_for(&[channel_type], alias)
+    }
+
+    /// `channel_external_peers` for a channel written more than one way in
+    /// `peer_groups` (WeCom WebSocket is both `wecom-ws` and `wecom_ws`).
+    ///
+    /// Resolving each spelling separately and concatenating the results loses
+    /// denies: an `ignore` under one spelling and `external_peers = ["*"]`
+    /// under the other never meet, so no deny marker is emitted and the
+    /// wildcard admits the ignored sender. One pass over every matching group
+    /// keeps the union-then-subtract contract whole.
+    pub fn channel_external_peers_for(&self, channel_types: &[&str], alias: &str) -> Vec<String> {
         let matching_groups: Vec<_> = self
             .peer_groups
             .values()
             .filter(|group| match group.channel.split_once('.') {
-                Some((ty, al)) => ty == channel_type && al == alias,
-                None => group.channel == channel_type,
+                Some((ty, al)) => channel_types.contains(&ty) && al == alias,
+                None => channel_types.contains(&group.channel.as_str()),
             })
             .collect();
         let ignored: std::collections::HashSet<String> = matching_groups
@@ -22579,6 +22591,34 @@ mod tests {
         assert_eq!(
             config.channel_external_peers("bluesky", "other"),
             vec!["*".to_string()]
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_external_peers_for_sees_every_spelling_of_one_channel() {
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.wecom_all]
+            channel = "wecom-ws.ops"
+            external_peers = ["*"]
+
+            [peer_groups.wecom_ignore]
+            channel = "wecom_ws.ops"
+            ignore = ["alice"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        // Resolved one spelling at a time, the wildcard and the ignore never
+        // meet, so no marker is emitted and concatenating the two results
+        // admits the ignored sender.
+        assert_eq!(
+            config.channel_external_peers("wecom-ws", "ops"),
+            vec!["*".to_string()]
+        );
+        assert_eq!(
+            config.channel_external_peers_for(&["wecom-ws", "wecom_ws"], "ops"),
+            vec!["*".to_string(), "!alice".to_string()]
         );
     }
 

@@ -7672,8 +7672,8 @@ fn build_channel_by_id(
                 let snapshot = wc.clone();
                 Arc::new(move || {
                     let config = cfg_arc.read();
-                    let mut external_peers = config.channel_external_peers("wecom-ws", &alias);
-                    external_peers.extend(config.channel_external_peers("wecom_ws", &alias));
+                    let external_peers =
+                        config.channel_external_peers_for(&["wecom-ws", "wecom_ws"], &alias);
 
                     if let Some(wc_ws) = config.channels.wecom_ws.get(&alias) {
                         WeComWsRuntimePolicy::from_config(wc_ws, external_peers)

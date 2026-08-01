@@ -59,13 +59,49 @@ pub fn is_user_denied_by(
     is_user_denied(allowed, user, &match_fn)
 }
 
-#[must_use]
-pub fn is_user_allowed(allowed: &[String], user: &str, mode: Match) -> bool {
-    let matches = |entry: &str, user: &str| match mode {
+fn matcher_for(mode: Match) -> impl Fn(&str, &str) -> bool {
+    move |entry: &str, user: &str| match mode {
         Match::Sensitive => entry == user,
         Match::CaseInsensitive => entry.eq_ignore_ascii_case(user),
-    };
-    if is_user_denied(allowed, user, &matches) {
+    }
+}
+
+/// Whether any identifier of one account is explicitly denied.
+///
+/// The plural of `is_user_denied_by`, for channels that learn several
+/// identifiers for the same sender at once.
+#[must_use]
+pub fn is_identity_denied_by(
+    allowed: &[String],
+    identities: &[&str],
+    match_fn: impl Fn(&str, &str) -> bool,
+) -> bool {
+    identities
+        .iter()
+        .any(|user| is_user_denied(allowed, user, &match_fn))
+}
+
+/// Whether an account is authorized, evaluated across every identifier it is
+/// known by, against a single snapshot of the resolved peer list.
+///
+/// Asking `is_user_allowed_by` once per identifier and OR-ing the answers is
+/// not equivalent. A deny names one identifier while the wildcard grants every
+/// other, so the deny goes false on its own identifier and the wildcard goes
+/// true on the next one, and the account is admitted. Any channel that accepts
+/// more than one identifier for the same sender, or that resolves the peer list
+/// more than once while deciding, has that hole.
+#[must_use]
+pub fn is_identity_allowed_by(
+    allowed: &[String],
+    identities: &[&str],
+    match_fn: impl Fn(&str, &str) -> bool,
+) -> bool {
+    // An account the channel could not identify is not authorized, wildcard or
+    // not: there is nothing for a deny rule to name.
+    if identities.is_empty() {
+        return false;
+    }
+    if is_identity_denied_by(allowed, identities, &match_fn) {
         return false;
     }
     if allowed.iter().any(|u| u == "*") {
@@ -74,7 +110,18 @@ pub fn is_user_allowed(allowed: &[String], user: &str, mode: Match) -> bool {
     allowed
         .iter()
         .filter(|entry| !entry.starts_with(DENY_PREFIX))
-        .any(|entry| matches(entry, user))
+        .any(|entry| identities.iter().any(|user| match_fn(entry, user)))
+}
+
+/// `is_identity_allowed_by` with the shared case-sensitivity selector.
+#[must_use]
+pub fn is_identity_allowed(allowed: &[String], identities: &[&str], mode: Match) -> bool {
+    is_identity_allowed_by(allowed, identities, matcher_for(mode))
+}
+
+#[must_use]
+pub fn is_user_allowed(allowed: &[String], user: &str, mode: Match) -> bool {
+    is_identity_allowed_by(allowed, &[user], matcher_for(mode))
 }
 
 #[must_use]
@@ -83,16 +130,7 @@ pub fn is_user_allowed_by(
     user: &str,
     match_fn: impl Fn(&str, &str) -> bool,
 ) -> bool {
-    if is_user_denied(allowed, user, &match_fn) {
-        return false;
-    }
-    if allowed.iter().any(|u| u == "*") {
-        return true;
-    }
-    allowed
-        .iter()
-        .filter(|entry| !entry.starts_with(DENY_PREFIX))
-        .any(|entry| match_fn(entry, user))
+    is_identity_allowed_by(allowed, &[user], match_fn)
 }
 
 #[cfg(test)]
@@ -167,6 +205,44 @@ mod tests {
         let list = vec!["*".to_string(), "!evil.com".to_string()];
         assert!(!is_user_allowed_by(&list, "spammer@evil.com", matcher));
         assert!(is_user_allowed_by(&list, "boss@corp.io", matcher));
+    }
+
+    #[test]
+    fn identity_deny_on_one_alias_beats_a_wildcard_reached_through_another() {
+        // The bypass this API exists to close: asking per identifier lets the
+        // deny go false on the handle and the wildcard go true on the DID.
+        let eq = |e: &str, u: &str| e == u;
+        let list = vec!["*".to_string(), "!alice.example".to_string()];
+        assert!(is_user_allowed_by(&list, "did:plc:alice", eq));
+        assert!(!is_identity_allowed_by(
+            &list,
+            &["alice.example", "did:plc:alice"],
+            eq
+        ));
+        // A different account still rides the wildcard through either alias.
+        assert!(is_identity_allowed_by(
+            &list,
+            &["bob.example", "did:plc:bob"],
+            eq
+        ));
+    }
+
+    #[test]
+    fn identity_grant_matches_through_any_alias() {
+        let eq = |e: &str, u: &str| e == u;
+        let list = vec!["did:plc:alice".to_string()];
+        assert!(is_identity_allowed_by(
+            &list,
+            &["alice.example", "did:plc:alice"],
+            eq
+        ));
+        assert!(!is_identity_allowed_by(&list, &["bob.example"], eq));
+    }
+
+    #[test]
+    fn identity_with_no_identifiers_is_denied_even_under_a_wildcard() {
+        let eq = |e: &str, u: &str| e == u;
+        assert!(!is_identity_allowed_by(&["*".to_string()], &[], eq));
     }
 
     #[test]

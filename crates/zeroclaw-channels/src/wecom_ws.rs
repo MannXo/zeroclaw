@@ -1966,10 +1966,14 @@ fn normalize_wecom_allowlist(entries: Vec<String>) -> Vec<String> {
 
 fn allowlist_matches(allowlist: &[String], candidate: &str) -> bool {
     let candidate = normalize_wecom_identity(candidate);
+    // Via the shared helper rather than a local wildcard test, so an `ignore`
+    // carried through as a deny marker is applied ahead of the wildcard.
     !candidate.is_empty()
-        && allowlist
-            .iter()
-            .any(|entry| entry == "*" || entry == &candidate)
+        && crate::allowlist::is_user_allowed(
+            allowlist,
+            &candidate,
+            crate::allowlist::Match::Sensitive,
+        )
 }
 
 fn evaluate_access_decision(
@@ -3228,6 +3232,31 @@ mod tests {
         );
         assert_eq!(
             evaluate_access_decision(&[], &["*".to_string()], &inbound),
+            AccessDecision::Allowed
+        );
+    }
+
+    #[test]
+    fn access_decision_denies_an_ignored_user_under_a_wildcard() {
+        // The resolved peer list carries `ignore` forward as a deny marker
+        // when a wildcard survives, so the channel must apply it rather than
+        // testing for `"*"` on its own.
+        let inbound = test_inbound("single", None, "zeroclaw_user");
+        assert_eq!(
+            evaluate_access_decision(
+                &["*".to_string(), "!zeroclaw_user".to_string()],
+                &[],
+                &inbound
+            ),
+            AccessDecision::Denied
+        );
+        let other = test_inbound("single", None, "someone_else");
+        assert_eq!(
+            evaluate_access_decision(
+                &["*".to_string(), "!zeroclaw_user".to_string()],
+                &[],
+                &other
+            ),
             AccessDecision::Allowed
         );
     }
