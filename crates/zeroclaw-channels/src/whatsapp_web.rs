@@ -276,16 +276,9 @@ impl WhatsAppWebChannel {
             (Some(entry_norm), Some(phone_norm)) => entry_norm == phone_norm,
             _ => false,
         };
-        // This channel historically accepted a surrounding-whitespace wildcard
-        // (`entry.trim() == "*"`), which is broader than the shared helper's
-        // exact `"*"` check, so keep that pre-check here. It runs after the
-        // deny check, so it cannot admit a sender the operator ignored.
-        if crate::allowlist::is_identity_denied_by(allowed_numbers, phones, matches) {
-            return false;
-        }
-        if allowed_numbers.iter().any(|entry| entry.trim() == "*") {
-            return true;
-        }
+        // The surrounding-whitespace wildcard this channel accepts is now what
+        // the shared helper accepts, so there is no broader local notion of the
+        // wildcard left to keep in step with the deny check.
         crate::allowlist::is_identity_allowed_by(allowed_numbers, phones, matches)
     }
 
@@ -3031,12 +3024,75 @@ mod tests {
         assert!(ch.is_number_allowed("+9999999999"));
     }
 
+    /// Resolve peers the way the daemon does, so these cover the
+    /// config-to-adapter boundary rather than a hand-built vector.
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_peers_from_config(toml_src: &str, alias: &str) -> Vec<String> {
+        let config: zeroclaw_config::schema::Config =
+            toml::from_str(toml_src).expect("peer-group config should parse");
+
+        config.channel_external_peers("whatsapp", alias)
+    }
+
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_deny_survives_the_whitespace_wildcard() {
-        // The channel's own wildcard pre-check is broader than the shared
-        // one, so it has to run after the deny rather than instead of it.
-        let peers = vec![" * ".to_string(), "!+15551234567".to_string()];
+        // A wildcard written with surrounding whitespace, resolved from config.
+        // Gating deny emission on the exact string `"*"` emitted no deny here
+        // while this matcher still read the entry as a wildcard.
+        let peers = whatsapp_peers_from_config(
+            r#"
+            [peer_groups.whatsapp_ops]
+            channel = "whatsapp.ops"
+            external_peers = [" * "]
+            ignore = ["+15551234567"]
+            "#,
+            "ops",
+        );
+        assert!(!WhatsAppWebChannel::is_number_allowed_for_list(
+            &peers,
+            "+15551234567"
+        ));
+        assert!(WhatsAppWebChannel::is_number_allowed_for_list(
+            &peers,
+            "+15559999999"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_ignore_denies_an_equivalent_phone_spelling() {
+        // This matcher reads `+15551234567` and `15551234567` as one number.
+        // Resolving the deny by comparing raw strings kept the grant and
+        // dropped the `ignore`, and the sender was then admitted.
+        let peers = whatsapp_peers_from_config(
+            r#"
+            [peer_groups.whatsapp_ops]
+            channel = "whatsapp.ops"
+            external_peers = ["+15551234567"]
+            ignore = ["15551234567"]
+            "#,
+            "ops",
+        );
+        assert!(!WhatsAppWebChannel::is_number_allowed_for_list(
+            &peers,
+            "+15551234567"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_ignore_denies_a_jid_spelling_of_the_granted_number() {
+        // A sender arrives as a JID, which normalizes to the same number.
+        let peers = whatsapp_peers_from_config(
+            r#"
+            [peer_groups.whatsapp_ops]
+            channel = "whatsapp.ops"
+            external_peers = ["*"]
+            ignore = ["15551234567@s.whatsapp.net"]
+            "#,
+            "ops",
+        );
         assert!(!WhatsAppWebChannel::is_number_allowed_for_list(
             &peers,
             "+15551234567"

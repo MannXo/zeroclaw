@@ -12,23 +12,44 @@ pub enum Match {
 
 /// Marks an entry as a deny rule rather than a grant.
 ///
-/// `Config::channel_external_peers` emits `!<name>` when a matching peer group
-/// grants `external_peers = ["*"]` while another sets `ignore`. A wildcard
-/// leaves no explicit entry to subtract, so without a marker the documented
-/// "union `external_peers`, then subtract `ignore`" contract would silently
-/// lose the operator's deny. No chat platform admits a username beginning with
-/// `!`, and an entry that did would now be denied rather than granted, so the
-/// reservation fails closed.
-pub const DENY_PREFIX: char = '!';
+/// `Config::channel_external_peers` emits `!<name>` for every `ignore` entry and
+/// applies none of them itself, because only the channel knows whether two
+/// spellings name the same account. Re-exported from the producing crate so the
+/// two halves of the contract cannot drift.
+pub use zeroclaw_config::schema::PEER_DENY_PREFIX as DENY_PREFIX;
+
+/// Whether a resolved peer list grants anyone.
+///
+/// Grants only, because the list also carries a `!name` deny for every `ignore`
+/// entry. "Is this list empty" and "has anybody been authorized" are therefore
+/// different questions, and code that gates pairing or explains an unauthorized
+/// sender wants this one: a config holding nothing but denies has authorized
+/// no one, so such a channel is still unpaired.
+#[must_use]
+pub fn grants_anyone(allowed: &[String]) -> bool {
+    allowed.iter().any(|entry| !entry.starts_with(DENY_PREFIX))
+}
+
+/// Whether a grant entry admits every sender.
+///
+/// Trimmed, because an operator writing `external_peers = [" * "]` means the
+/// wildcard, and a channel matcher that trims would honour it as one while an
+/// exact comparison here would not.
+fn is_wildcard(entry: &str) -> bool {
+    entry.trim() == "*"
+}
 
 /// Whether a deny entry names `user`.
 ///
 /// A deny rule is checked with the caller's own notion of identity *and* with a
-/// normalized comparison (leading `@` stripped, ASCII case-insensitive), which
-/// is how `ignore` is normalized when it is subtracted from explicit entries.
-/// A blocklist errs toward denying, so matching a superset is the safe
-/// direction: the alternative admits a sender the operator wrote down.
+/// normalized comparison (leading `@` stripped, ASCII case-insensitive). A
+/// blocklist errs toward denying, so matching a superset is the safe direction:
+/// the alternative admits a sender the operator wrote down.
 fn deny_names(entry: &str, user: &str, match_fn: &impl Fn(&str, &str) -> bool) -> bool {
+    // `ignore = ["*"]` denies every sender, the mirror of a wildcard grant.
+    if is_wildcard(entry) {
+        return true;
+    }
     let normalize = |value: &str| value.trim().trim_start_matches('@').to_string();
     match_fn(entry, user) || normalize(entry).eq_ignore_ascii_case(&normalize(user))
 }
@@ -104,13 +125,15 @@ pub fn is_identity_allowed_by(
     if is_identity_denied_by(allowed, identities, &match_fn) {
         return false;
     }
-    if allowed.iter().any(|u| u == "*") {
+    let grants = || {
+        allowed
+            .iter()
+            .filter(|entry| !entry.starts_with(DENY_PREFIX))
+    };
+    if grants().any(|entry| is_wildcard(entry)) {
         return true;
     }
-    allowed
-        .iter()
-        .filter(|entry| !entry.starts_with(DENY_PREFIX))
-        .any(|entry| identities.iter().any(|user| match_fn(entry, user)))
+    grants().any(|entry| identities.iter().any(|user| match_fn(entry, user)))
 }
 
 /// `is_identity_allowed_by` with the shared case-sensitivity selector.
@@ -154,9 +177,9 @@ mod tests {
 
     #[test]
     fn deny_marker_overrides_an_explicit_grant() {
-        // Subtraction in `channel_external_peers` normally removes the grant
-        // before it reaches here, so this pins the precedence rather than the
-        // config path: a deny wins wherever both appear.
+        // The shape `channel_external_peers` produces for an explicit grant that
+        // another group ignores. Nothing is subtracted there, so this precedence
+        // is what makes the deny effective.
         let list = vec!["alice".to_string(), "!alice".to_string()];
         assert!(!is_user_allowed(&list, "alice", Match::Sensitive));
     }
@@ -172,12 +195,51 @@ mod tests {
 
     #[test]
     fn deny_marker_ignores_case_and_a_leading_at() {
-        // A blocklist errs toward denying: `ignore` is normalized when it is
-        // subtracted, so the marker path must not admit a sender that the
-        // subtraction path would have removed.
+        // A blocklist errs toward denying, so a deny is matched more broadly
+        // than a grant: on a case-sensitive channel `ignore = ["Alice"]` still
+        // denies `alice`.
         let list = vec!["*".to_string(), "!@Alice".to_string()];
         assert!(!is_user_allowed(&list, "alice", Match::Sensitive));
         assert!(!is_user_allowed(&list, "@ALICE", Match::Sensitive));
+    }
+
+    #[test]
+    fn grants_anyone_ignores_deny_markers() {
+        // A list of nothing but denies has authorized no one, so callers that
+        // treated a non-empty list as "somebody is paired" need this instead.
+        assert!(!grants_anyone(&["!alice".to_string()]));
+        assert!(!grants_anyone(&[]));
+        assert!(grants_anyone(&["*".to_string(), "!alice".to_string()]));
+        assert!(grants_anyone(&["alice".to_string()]));
+    }
+
+    #[test]
+    fn wildcard_deny_denies_everyone() {
+        // `ignore = ["*"]` is the mirror of a wildcard grant. Removing the
+        // wildcard grant by subtraction used to achieve this; now the deny
+        // itself has to say it.
+        let list = vec!["*".to_string(), "!*".to_string()];
+        assert!(!is_user_allowed(&list, "alice", Match::Sensitive));
+        assert!(!is_user_allowed(&list, "bob", Match::Sensitive));
+    }
+
+    #[test]
+    fn wildcard_deny_outranks_an_explicit_grant() {
+        let list = vec!["alice".to_string(), "!*".to_string()];
+        assert!(!is_user_allowed(&list, "alice", Match::Sensitive));
+    }
+
+    #[test]
+    fn padded_wildcard_grant_is_a_wildcard() {
+        // Channels that trim before matching read `" * "` as the wildcard. The
+        // shared helper has to agree, or a deny is evaluated against a list this
+        // helper thinks grants nobody while the channel thinks it grants all.
+        let list = vec![" * ".to_string()];
+        assert!(is_user_allowed(&list, "alice", Match::Sensitive));
+
+        let denied = vec![" * ".to_string(), "!alice".to_string()];
+        assert!(!is_user_allowed(&denied, "alice", Match::Sensitive));
+        assert!(is_user_allowed(&denied, "bob", Match::Sensitive));
     }
 
     #[test]

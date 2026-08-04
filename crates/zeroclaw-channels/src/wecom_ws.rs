@@ -1981,7 +1981,11 @@ fn evaluate_access_decision(
     allowed_groups: &[String],
     inbound: &ParsedInbound,
 ) -> AccessDecision {
-    if allowed_users.is_empty() && allowed_groups.is_empty() {
+    // Grants, not entries: a policy holding only denies has authorized no one,
+    // which is the missing-allowlist case the operator needs told about.
+    if !crate::allowlist::grants_anyone(allowed_users)
+        && !crate::allowlist::grants_anyone(allowed_groups)
+    {
         return AccessDecision::AllowlistMissing;
     }
 
@@ -3146,6 +3150,38 @@ mod tests {
         );
         assert_eq!(policy.allowed_groups, vec!["group-1".to_string()]);
         assert_eq!(policy.bot_name.as_deref(), Some("danya"));
+    }
+
+    #[test]
+    fn split_channel_spellings_carry_one_ignore_into_the_runtime_policy() {
+        // The normal daemon startup path resolved the two spellings separately
+        // and concatenated them, so a wildcard under `wecom-ws` never met an
+        // `ignore` under `wecom_ws` and the ignored sender was admitted. Both
+        // startup paths now share `wecom_ws_external_peers`, which this uses.
+        let config: zeroclaw_config::schema::Config = toml::from_str(
+            r#"
+            [peer_groups.wecom_grant]
+            channel = "wecom-ws.ops"
+            external_peers = ["*"]
+
+            [peer_groups.wecom_deny]
+            channel = "wecom_ws.ops"
+            ignore = ["alice"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        let peers = crate::orchestrator::wecom_ws_external_peers(&config, "ops");
+        let policy = WeComWsRuntimePolicy::from_config(&test_wecom_ws_config(), peers);
+
+        assert!(
+            !allowlist_matches(&policy.direct_userids, "alice"),
+            "an ignore under either spelling must deny the sender"
+        );
+        assert!(
+            allowlist_matches(&policy.direct_userids, "bob"),
+            "an unignored sender still rides the wildcard"
+        );
     }
 
     #[test]

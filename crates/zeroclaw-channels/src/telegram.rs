@@ -606,7 +606,7 @@ impl TelegramChannel {
         mention_only: bool,
     ) -> Self {
         let alias = alias.into();
-        let has_peers = !peer_resolver().is_empty();
+        let has_peers = crate::allowlist::grants_anyone(&peer_resolver());
         let pairing = if has_peers {
             None
         } else {
@@ -967,6 +967,15 @@ impl TelegramChannel {
             .as_ref()
             .and_then(PairingGuard::pairing_code)
             .is_some()
+    }
+
+    /// Whether any peer group has authorized someone on this channel.
+    ///
+    /// Grants only. The resolved list also carries the denies for `ignore`, so a
+    /// config holding nothing but denies has authorized no one and the channel is
+    /// still unpaired.
+    fn has_authorized_peer(&self) -> bool {
+        crate::allowlist::grants_anyone(&(self.peer_resolver)())
     }
 
     /// Build the operator-facing `zeroclaw channel bind-telegram` command for
@@ -1689,7 +1698,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         // unpaired. Once peers exist (resolved live), the one-time code is
         // moot and the hint just confuses an operator who already authorized
         // someone — the "already assigned but still asks" complaint.
-        if self.pairing_code_active() && (self.peer_resolver)().is_empty() {
+        if self.pairing_code_active() && !self.has_authorized_peer() {
             let _ = self
                 .send(&SendMessage::new(
                     "ℹ️ If the operator provides a one-time pairing code, you can also run `/bind <code>`.",
@@ -4900,6 +4909,22 @@ mod tests {
             mention_only,
         );
         assert!(!ch.pairing_code_active());
+    }
+
+    #[test]
+    fn telegram_pairing_stays_active_when_only_denies_are_configured() {
+        // The resolved peer list carries a deny for every `ignore` entry, so a
+        // config with `ignore` and no grant resolves non-empty while having
+        // authorized nobody. Reading that as "already paired" would leave the
+        // operator unable to pair at all.
+        let ch = TelegramChannel::new(
+            "t".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["!alice".into()]),
+            false,
+        );
+        assert!(ch.pairing_code_active());
+        assert!(!ch.has_authorized_peer());
     }
 
     #[test]

@@ -682,6 +682,102 @@ mod tests {
         );
     }
 
+    /// Resolve peers the way the daemon does, from config, so the test covers
+    /// the config-to-adapter boundary rather than a hand-built vector.
+    fn peers_from_config(toml_src: &str, alias: &str) -> Vec<String> {
+        let config: zeroclaw_config::schema::Config =
+            toml::from_str(toml_src).expect("peer-group config should parse");
+
+        config.channel_external_peers("reddit", alias)
+    }
+
+    #[test]
+    fn ignore_denies_a_grant_written_with_the_display_prefix() {
+        // Reddit reads `u/alice` and `alice` as one account. Resolving the deny
+        // by comparing raw strings kept the grant and dropped the `ignore`, and
+        // this gate then authorized the sender the operator had ignored.
+        let ch = make_channel_with(
+            Vec::new(),
+            peers_from_config(
+                r#"
+                [peer_groups.reddit_ops]
+                channel = "reddit.ops"
+                external_peers = ["u/alice"]
+                ignore = ["alice"]
+                "#,
+                "ops",
+            ),
+        );
+
+        assert!(
+            ch.parse_item(&dm_from("alice")).is_none(),
+            "a deny naming the account must survive the resolver"
+        );
+    }
+
+    #[test]
+    fn ignore_written_with_the_display_prefix_denies_a_bare_grant() {
+        // The inverse spelling, so neither side of the comparison is privileged.
+        let ch = make_channel_with(
+            Vec::new(),
+            peers_from_config(
+                r#"
+                [peer_groups.reddit_ops]
+                channel = "reddit.ops"
+                external_peers = ["alice"]
+                ignore = ["u/alice"]
+                "#,
+                "ops",
+            ),
+        );
+
+        assert!(ch.parse_item(&dm_from("alice")).is_none());
+    }
+
+    #[test]
+    fn config_wildcard_with_ignore_denies_only_the_ignored_sender() {
+        let peers = peers_from_config(
+            r#"
+            [peer_groups.reddit_all]
+            channel = "reddit"
+            external_peers = ["*"]
+
+            [peer_groups.reddit_ops]
+            channel = "reddit.ops"
+            ignore = ["alice"]
+            "#,
+            "ops",
+        );
+        let ch = make_channel_with(Vec::new(), peers);
+
+        assert!(ch.parse_item(&dm_from("alice")).is_none());
+        assert_eq!(
+            ch.parse_item(&dm_from("bob"))
+                .expect("an unignored sender still rides the wildcard")
+                .sender,
+            "bob"
+        );
+    }
+
+    #[test]
+    fn config_ignoring_the_wildcard_denies_everyone() {
+        let ch = make_channel_with(
+            Vec::new(),
+            peers_from_config(
+                r#"
+                [peer_groups.reddit_all]
+                channel = "reddit"
+                external_peers = ["*"]
+                ignore = ["*"]
+                "#,
+                "ops",
+            ),
+        );
+
+        assert!(ch.parse_item(&dm_from("alice")).is_none());
+        assert!(ch.parse_item(&dm_from("bob")).is_none());
+    }
+
     #[test]
     fn ignored_peer_is_denied_regardless_of_username_case() {
         // Reddit usernames are unique case-insensitively, so a deny written in
