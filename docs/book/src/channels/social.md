@@ -16,6 +16,12 @@ Broadcast / social-feed integrations. These differ from chat channels in two way
 A peer entry may be either the handle or the DID. Prefer the DID if you want the
 entry to survive the account renaming itself.
 
+Each poll walks the unread notifications to the end before delivering any of
+them, so a failure part-way through the walk delivers nothing and retries the
+whole range on the next poll. That trades a short delay for not re-delivering
+the pages that did arrive: a notification the agent has already answered is
+worse than one it answers five seconds late.
+
 ## Nostr
 
 {{#peer-group nostr}}

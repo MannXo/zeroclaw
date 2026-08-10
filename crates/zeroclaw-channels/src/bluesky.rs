@@ -55,6 +55,14 @@ struct NotificationPage {
     next_cursor: Option<String>,
 }
 
+/// One page walk that reached the read boundary. Its existence is the
+/// precondition for delivering anything: a partial walk produces no value, so
+/// there is nothing to send and nothing to commit.
+struct CompletedWalk {
+    messages: Vec<ChannelMessage>,
+    newest_unread: Option<String>,
+}
+
 #[allow(dead_code)]
 #[derive(Deserialize)]
 struct Notification {
@@ -355,6 +363,48 @@ impl BlueskyChannel {
         }
     }
 
+    /// Walk the unread notification pages newest-first and collect every
+    /// accepted message, or `None` if the walk did not reach the read
+    /// boundary.
+    ///
+    /// Nothing is returned for a partial walk, so delivery and the seen
+    /// watermark can only move together: page one is not handed to the caller
+    /// until the pages behind it have also been examined. `fetch_page` yields
+    /// `None` for a failure it has already reported.
+    async fn walk_unread_notifications<F, Fut>(&self, fetch_page: F) -> Option<CompletedWalk>
+    where
+        F: Fn(Option<String>) -> Fut,
+        Fut: std::future::Future<Output = Option<NotificationListResponse>>,
+    {
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = std::collections::HashSet::new();
+        let mut newest_unread: Option<String> = None;
+        let mut messages = Vec::new();
+
+        loop {
+            let listing = fetch_page(cursor.clone()).await?;
+            let page = self.process_notification_page(&listing, &mut newest_unread);
+            messages.extend(page.messages);
+
+            let Some(next_cursor) = page.next_cursor else {
+                return Some(CompletedWalk {
+                    messages,
+                    newest_unread,
+                });
+            };
+            if !seen_cursors.insert(next_cursor.clone()) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "notification pagination returned a repeated cursor"
+                );
+                return None;
+            }
+            cursor = Some(next_cursor);
+        }
+    }
+
     /// Mark notifications as read up to a given timestamp.
     async fn update_seen(&self, seen_at: &str) -> Result<()> {
         let token = self.get_access_jwt().await?;
@@ -493,100 +543,89 @@ impl Channel for BlueskyChannel {
             };
 
             let client = self.http_client();
-            let mut cursor: Option<String> = None;
-            let mut seen_cursors = std::collections::HashSet::new();
-            let mut latest_indexed_at: Option<String> = None;
-            let mut poll_complete = false;
+            let walk = self
+                .walk_unread_notifications(|cursor| {
+                    let client = client.clone();
+                    let token = token.clone();
+                    async move {
+                        let mut query = vec![("limit", "25")];
+                        if let Some(value) = cursor.as_deref() {
+                            query.push(("cursor", value));
+                        }
 
-            loop {
-                let mut query = vec![("limit", "25")];
-                if let Some(value) = cursor.as_deref() {
-                    query.push(("cursor", value));
-                }
+                        let resp = match client
+                            .get(format!(
+                                "{BSKY_API_BASE}/app.bsky.notification.listNotifications"
+                            ))
+                            .bearer_auth(&token)
+                            .query(&query)
+                            .send()
+                            .await
+                        {
+                            Ok(response) => response,
+                            Err(error) => {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(::serde_json::json!({"error": format!("{error}")})),
+                                    "poll error"
+                                );
+                                return None;
+                            }
+                        };
 
-                let resp = match client
-                    .get(format!(
-                        "{BSKY_API_BASE}/app.bsky.notification.listNotifications"
-                    ))
-                    .bearer_auth(&token)
-                    .query(&query)
-                    .send()
-                    .await
-                {
-                    Ok(response) => response,
-                    Err(error) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{error}")})),
-                            "poll error"
-                        );
-                        break;
+                        if !resp.status().is_success() {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                                &format!("notifications failed: {}", resp.status())
+                            );
+                            return None;
+                        }
+
+                        match resp.json::<NotificationListResponse>().await {
+                            Ok(listing) => Some(listing),
+                            Err(error) => {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(::serde_json::json!({"error": format!("{error}")})),
+                                    "parse error"
+                                );
+                                None
+                            }
+                        }
                     }
-                };
+                })
+                .await;
 
-                if !resp.status().is_success() {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                        &format!("notifications failed: {}", resp.status())
-                    );
-                    break;
-                }
-
-                let listing: NotificationListResponse = match resp.json().await {
-                    Ok(listing) => listing,
-                    Err(error) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{error}")})),
-                            "parse error"
-                        );
-                        break;
-                    }
-                };
-
-                let page = self.process_notification_page(&listing, &mut latest_indexed_at);
-                for message in page.messages {
-                    if tx.send(message).await.is_err() {
-                        return Ok(());
-                    }
-                }
-
-                let Some(next_cursor) = page.next_cursor else {
-                    poll_complete = true;
-                    break;
-                };
-                if !seen_cursors.insert(next_cursor.clone()) {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                        "notification pagination returned a repeated cursor"
-                    );
-                    break;
-                }
-                cursor = Some(next_cursor);
-            }
-
-            // Do not advance past messages on an unexamined page after a
-            // partial fetch failure. They will be retried on the next poll.
-            if !poll_complete {
+            // A partial walk yields no messages at all, so a page failure
+            // cannot leave earlier pages delivered with the watermark behind
+            // them. The whole unread range is re-walked on the next poll.
+            let Some(walk) = walk else {
                 continue;
+            };
+
+            for message in walk.messages {
+                if tx.send(message).await.is_err() {
+                    return Ok(());
+                }
             }
 
             // Mark as seen
-            if let Some(ref seen_at) = latest_indexed_at
+            if let Some(ref seen_at) = walk.newest_unread
                 && let Err(e) = self.update_seen(seen_at).await
             {
                 ::zeroclaw_log::record!(
@@ -772,6 +811,80 @@ mod tests {
         assert_eq!(second.messages.len(), 1);
         assert_eq!(second.messages[0].sender, "allowed.bsky.social");
         assert!(second.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_partial_page_walk_delivers_nothing_and_the_retry_delivers_once() {
+        // Dispatching each page as it arrived meant a page-two failure left
+        // page one delivered while the watermark stayed put, so every five
+        // second poll delivered page one again for as long as the failure
+        // lasted.
+        let ch = make_channel_with_peers(vec!["*".to_string()]);
+        let page_one = || NotificationListResponse {
+            notifications: vec![make_notification(
+                "mention",
+                "allowed.bsky.social",
+                "did:plc:allowed",
+                "@testbot first page",
+                false,
+            )],
+            cursor: Some("second-page".to_string()),
+        };
+        let page_two = || NotificationListResponse {
+            notifications: vec![make_notification(
+                "mention",
+                "allowed.bsky.social",
+                "did:plc:allowed",
+                "@testbot second page",
+                false,
+            )],
+            cursor: None,
+        };
+
+        let fetches = std::cell::Cell::new(0);
+        let partial = ch
+            .walk_unread_notifications(|cursor| {
+                fetches.set(fetches.get() + 1);
+                let listing = match cursor.as_deref() {
+                    None => Some(page_one()),
+                    Some("second-page") => None,
+                    other => panic!("unexpected cursor {other:?}"),
+                };
+                async move { listing }
+            })
+            .await;
+        assert!(
+            partial.is_none(),
+            "a page-two failure must not hand page one's message to the caller"
+        );
+        assert_eq!(fetches.get(), 2, "the walk must have reached page two");
+
+        let retried = ch
+            .walk_unread_notifications(|cursor| {
+                let listing = match cursor.as_deref() {
+                    None => Some(page_one()),
+                    Some("second-page") => Some(page_two()),
+                    other => panic!("unexpected cursor {other:?}"),
+                };
+                async move { listing }
+            })
+            .await
+            .expect("a walk that reaches the read boundary must yield its messages");
+
+        let delivered: Vec<&str> = retried
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(
+            delivered,
+            vec!["@testbot first page", "@testbot second page"],
+            "page one is delivered by the retry, and only by the retry"
+        );
+        assert!(
+            retried.newest_unread.is_some(),
+            "the watermark commits with the delivery, not before it"
+        );
     }
 
     #[test]
