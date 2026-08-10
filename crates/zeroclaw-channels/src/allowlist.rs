@@ -18,16 +18,72 @@ pub enum Match {
 /// two halves of the contract cannot drift.
 pub use zeroclaw_config::schema::PEER_DENY_PREFIX as DENY_PREFIX;
 
-/// Whether a resolved peer list grants anyone.
+/// Whether a resolved peer list can admit anybody at all.
 ///
-/// Grants only, because the list also carries a `!name` deny for every `ignore`
-/// entry. "Is this list empty" and "has anybody been authorized" are therefore
-/// different questions, and code that gates pairing or explains an unauthorized
-/// sender wants this one: a config holding nothing but denies has authorized
-/// no one, so such a channel is still unpaired.
+/// "Is this list empty" and "has anybody been authorized" are different
+/// questions, because the list also carries a `!name` deny for every `ignore`
+/// entry. Code that gates pairing or explains an unauthorized sender wants this
+/// one.
+///
+/// A grant only counts when a deny does not already shadow it, so
+/// `["alice", "!alice"]` and `["*", "!*"]` both answer `false`: they are
+/// syntactic grants that admit nobody, and reporting them as authorization
+/// leaves the operator with no accepted sender and no pairing route back. Only
+/// the channel's own matcher can decide the general case, so this answers
+/// conservatively with the normalized comparison a deny is matched by anyway —
+/// erring toward "nobody is authorized" is what keeps recovery pairing
+/// available, and the sender that then arrives is still judged by
+/// `is_identity_allowed_by`.
 #[must_use]
 pub fn grants_anyone(allowed: &[String]) -> bool {
-    allowed.iter().any(|entry| !entry.starts_with(DENY_PREFIX))
+    let denies: Vec<&str> = allowed
+        .iter()
+        .filter_map(|entry| entry.strip_prefix(DENY_PREFIX))
+        .collect();
+    // `ignore = ["*"]` denies every sender, so no grant survives it.
+    if denies.iter().any(|entry| is_wildcard(entry)) {
+        return false;
+    }
+    allowed
+        .iter()
+        .filter(|entry| !entry.starts_with(DENY_PREFIX))
+        .any(|grant| {
+            // A wildcard grant outlives any named deny: every sender the denies
+            // do not name still rides it.
+            is_wildcard(grant)
+                || !denies
+                    .iter()
+                    .any(|deny| deny_names(deny, grant, &|entry: &str, user: &str| entry == user))
+        })
+}
+
+/// The conflict message for a pairing write an `ignore` would shadow, or
+/// `None` when the write can proceed.
+///
+/// Pairing has to end in an identity the admission matcher accepts. When an
+/// explicit deny names the identity, appending a grant persists something the
+/// deny immediately shadows: the operator is told the account is bound and it
+/// still cannot talk, and `grants_anyone` keeps offering the same prompt. Every
+/// writer of a paired identity asks this first so the `ignore` stays
+/// authoritative and the operator gets told what to edit.
+///
+/// The message names the config location and never the identity: identities are
+/// durable personal identifiers and callers log this error.
+#[must_use]
+pub fn pairing_deny_conflict(
+    allowed: &[String],
+    channel_type: &str,
+    alias: &str,
+    identity: &str,
+    match_fn: impl Fn(&str, &str) -> bool,
+) -> Option<String> {
+    is_user_denied(allowed, identity, &match_fn).then(|| {
+        format!(
+            "paired {channel_type}.{alias} identity is denied by an `ignore` entry in a \
+             matching [peer_groups.*] block — remove that entry from config.toml, then \
+             pair again"
+        )
+    })
 }
 
 /// Whether a grant entry admits every sender.
@@ -211,6 +267,61 @@ mod tests {
         assert!(!grants_anyone(&[]));
         assert!(grants_anyone(&["*".to_string(), "!alice".to_string()]));
         assert!(grants_anyone(&["alice".to_string()]));
+    }
+
+    #[test]
+    fn grants_anyone_rejects_a_grant_its_own_deny_shadows() {
+        // A grant cancelled by a deny admits nobody. Reporting it as
+        // authorization is what suppresses the pairing prompt, so the operator
+        // is left with no accepted sender and no way back in.
+        for shadowed in [
+            vec!["alice".to_string(), "!alice".to_string()],
+            // Broader deny matching applies here too, or a differently spelled
+            // ignore would look like a live grant.
+            vec!["alice".to_string(), "!@ALICE".to_string()],
+        ] {
+            assert!(!grants_anyone(&shadowed));
+            assert!(!is_user_allowed(&shadowed, "alice", Match::Sensitive));
+        }
+
+        // One named deny does not shadow a wildcard: every other sender is
+        // still admitted, so pairing correctly stays suppressed.
+        let wildcard = vec!["*".to_string(), "!alice".to_string()];
+        assert!(grants_anyone(&wildcard));
+        assert!(is_user_allowed(&wildcard, "bob", Match::Sensitive));
+
+        // A wildcard deny shadows every grant, wildcard or named.
+        assert!(!grants_anyone(&["*".to_string(), "!*".to_string()]));
+        assert!(!grants_anyone(&["alice".to_string(), "!*".to_string()]));
+
+        // A surviving grant alongside a shadowed one still counts.
+        let partial = vec!["alice".to_string(), "bob".to_string(), "!alice".to_string()];
+        assert!(grants_anyone(&partial));
+        assert!(is_user_allowed(&partial, "bob", Match::Sensitive));
+    }
+
+    #[test]
+    fn pairing_deny_conflict_reports_the_config_location_not_the_identity() {
+        let denied = vec!["*".to_string(), "!+15551234567".to_string()];
+        let conflict =
+            pairing_deny_conflict(&denied, "whatsapp", "admin", "+15551234567", |a, b| a == b)
+                .expect("an ignored identity must be reported as a conflict");
+        assert!(conflict.contains("whatsapp.admin"));
+        assert!(conflict.contains("ignore"));
+        assert!(
+            !conflict.contains("+15551234567"),
+            "identities are personal data and callers log this message: {conflict}"
+        );
+
+        // Nothing to report when the write would actually take effect.
+        assert!(
+            pairing_deny_conflict(&denied, "whatsapp", "admin", "+15559999999", |a, b| a == b)
+                .is_none()
+        );
+        assert!(
+            pairing_deny_conflict(&[], "whatsapp", "admin", "+15551234567", |a, b| a == b)
+                .is_none()
+        );
     }
 
     #[test]

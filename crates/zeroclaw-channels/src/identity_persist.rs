@@ -30,6 +30,10 @@ use zeroclaw_config::schema::Config;
 /// reader (`Config::channel_external_peers`) authorizes by — the group's
 /// `channel` field, never the `peer_groups` map key:
 ///
+/// - If a matching group's `ignore` denies the identity, the merge is
+///   rejected: the deny outranks any grant, so appending one would persist
+///   an entry the admission matcher immediately shadows and report a
+///   pairing that cannot work.
 /// - If the identity is already authorized for `<channel_type>.<alias>`
 ///   through *any* matching group (instance-scoped or type-wide), nothing
 ///   is written.
@@ -73,6 +77,18 @@ pub(crate) fn merge_external_peer(
         );
     }
 
+    let resolved = cfg.channel_external_peers(channel_type, alias);
+
+    if let Some(conflict) = crate::allowlist::pairing_deny_conflict(
+        &resolved,
+        channel_type,
+        alias,
+        normalized,
+        |entry, user| entry.eq_ignore_ascii_case(user),
+    ) {
+        anyhow::bail!(conflict);
+    }
+
     // Already authorized through any group the reader matches (including
     // type-wide groups)? Then there is nothing to persist. This asks the same
     // question the runtime asks, through the same helper, so writer and reader
@@ -81,7 +97,7 @@ pub(crate) fn merge_external_peer(
     // sit alongside an `ignore` that denies it, and pairing must not report an
     // ignored identity as authorized.
     if crate::allowlist::is_user_allowed(
-        &cfg.channel_external_peers(channel_type, alias),
+        &resolved,
         normalized,
         crate::allowlist::Match::CaseInsensitive,
     ) {
@@ -314,6 +330,72 @@ mod tests {
     }
 
     #[test]
+    fn merge_surfaces_a_conflict_instead_of_persisting_a_shadowed_grant() {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        // The end of the recovery path: pairing is available again once a
+        // fully shadowed grant no longer counts as authorization, so it must
+        // not dead-end by appending a grant the deny immediately shadows.
+        let mut config = config_with_whatsapp("admin");
+        config.peer_groups.insert(
+            "whatsapp_admin".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("whatsapp.admin".to_string()),
+                external_peers: vec![PeerUsername::new("+15551234567".to_string())],
+                ignore: vec![PeerUsername::new("+15551234567".to_string())],
+                ..Default::default()
+            },
+        );
+
+        let err = merge_external_peer(&mut config, "whatsapp", "admin", "+15551234567")
+            .expect_err("an ignored identity must not be persisted as a grant");
+        let message = err.to_string();
+        assert!(
+            message.contains("ignore"),
+            "names the field to edit: {message}"
+        );
+        assert!(
+            !message.contains("+15551234567"),
+            "the identity is personal data and callers log this error: {message}"
+        );
+
+        let group = config.peer_groups.get("whatsapp_admin").unwrap();
+        assert_eq!(
+            group.external_peers.len(),
+            1,
+            "no second, equally shadowed grant was appended"
+        );
+        assert!(
+            !crate::allowlist::is_user_allowed(
+                &config.channel_external_peers("whatsapp", "admin"),
+                "+15551234567",
+                crate::allowlist::Match::CaseInsensitive,
+            ),
+            "the operator's ignore stays authoritative"
+        );
+
+        // With the ignore removed, the same pairing attempt succeeds and the
+        // identity is genuinely admissible: the recovery path terminates.
+        config
+            .peer_groups
+            .get_mut("whatsapp_admin")
+            .unwrap()
+            .ignore
+            .clear();
+        assert!(
+            !merge_external_peer(&mut config, "whatsapp", "admin", "+15551234567")
+                .expect("merge succeeds once the deny is gone"),
+            "the existing grant is now effective, so nothing needs writing"
+        );
+        assert!(crate::allowlist::is_user_allowed(
+            &config.channel_external_peers("whatsapp", "admin"),
+            "+15551234567",
+            crate::allowlist::Match::CaseInsensitive,
+        ));
+    }
+
+    #[test]
     fn merge_rejects_conventional_key_with_mismatched_channel_ref() {
         use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
         use zeroclaw_config::providers::ChannelRef;
@@ -509,7 +591,8 @@ mod tests {
         // The resolved list carries grants and denies together, so a grant this
         // identity matches can sit beside an `ignore` that denies it. Comparing
         // the entries by string would find the grant and report the identity as
-        // already authorized, which is the opposite of the truth.
+        // already authorized, which is the opposite of the truth. The deny
+        // reaches here through a type-wide group, not the instance-scoped one.
         let mut config = config_with_whatsapp("admin");
         config.peer_groups.insert(
             "whatsapp_everyone".to_string(),
@@ -521,9 +604,15 @@ mod tests {
             },
         );
 
-        assert!(
-            merge_external_peer(&mut config, "whatsapp", "admin", "+15551234567").unwrap(),
-            "an ignored identity is not authorized, so pairing has work to do"
+        // Neither of the two silent outcomes is right: `Ok(false)` would claim
+        // the identity is already authorized, and `Ok(true)` would append a
+        // grant the deny shadows just as thoroughly.
+        merge_external_peer(&mut config, "whatsapp", "admin", "+15551234567")
+            .expect_err("an ignored identity is neither authorized nor grantable by appending");
+        assert_eq!(
+            config.peer_groups.len(),
+            1,
+            "no group was created to hold a shadowed grant"
         );
     }
 

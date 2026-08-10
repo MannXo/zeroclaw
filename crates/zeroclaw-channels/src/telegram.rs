@@ -929,6 +929,15 @@ impl TelegramChannel {
                     self.alias
                 );
             }
+            if let Some(conflict) = crate::allowlist::pairing_deny_conflict(
+                &cfg.channel_external_peers("telegram", &self.alias),
+                "telegram",
+                &self.alias,
+                &normalized,
+                |entry, user| Self::normalize_identity(entry) == user,
+            ) {
+                anyhow::bail!(conflict);
+            }
             let group = cfg
                 .peer_groups
                 .entry(group_name)
@@ -972,9 +981,10 @@ impl TelegramChannel {
 
     /// Whether any peer group has authorized someone on this channel.
     ///
-    /// Grants only. The resolved list also carries the denies for `ignore`, so a
-    /// config holding nothing but denies has authorized no one and the channel is
-    /// still unpaired.
+    /// Effective grants only. The resolved list also carries the denies for
+    /// `ignore`, so a config holding nothing but denies, or nothing but grants
+    /// its own denies shadow, has authorized no one and the channel is still
+    /// unpaired.
     fn has_authorized_peer(&self) -> bool {
         crate::allowlist::grants_anyone(&(self.peer_resolver)())
     }
@@ -4998,6 +5008,91 @@ mod tests {
         );
         assert!(ch.pairing_code_active());
         assert!(!ch.has_authorized_peer());
+    }
+
+    #[test]
+    fn telegram_pairing_stays_active_when_every_grant_is_shadowed() {
+        // A grant cancelled by a deny is not authorization. Counting it as one
+        // suppressed the bind code while the admission matcher admitted nobody,
+        // which is an operator with no accepted sender and no route back.
+        for shadowed in [
+            vec!["alice".to_string(), "!alice".to_string()],
+            vec!["*".to_string(), "!*".to_string()],
+        ] {
+            let ch = TelegramChannel::new(
+                "t".into(),
+                "telegram_test_alias",
+                Arc::new(move || shadowed.clone()),
+                false,
+            );
+            assert!(
+                ch.pairing_code_active(),
+                "the bind code must still be issued"
+            );
+            assert!(!ch.has_authorized_peer());
+            assert!(!ch.is_any_user_allowed(["alice", "123456789"]));
+        }
+    }
+
+    #[tokio::test]
+    async fn telegram_bind_reports_a_conflict_instead_of_appending_a_shadowed_grant() {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        // The other end of the re-enabled prompt. Pairing is offered again once
+        // a shadowed grant stops counting as authorization, so the bind must not
+        // dead-end by appending a grant the same `ignore` shadows.
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                bot_token: "t".to_string(),
+                ..Default::default()
+            },
+        );
+        config.peer_groups.insert(
+            "telegram_default".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("telegram.default".to_string()),
+                external_peers: vec![PeerUsername::new("123456789".to_string())],
+                ignore: vec![PeerUsername::new("123456789".to_string())],
+                ..Default::default()
+            },
+        );
+        let config = Arc::new(RwLock::new(config));
+
+        let ch = TelegramChannel::new("t".into(), "default", Arc::new(Vec::new), false)
+            .with_persistence(Arc::clone(&config));
+
+        let err = ch
+            .persist_allowed_identity("123456789")
+            .await
+            .expect_err("an ignored identity must not be persisted as a grant");
+        let message = err.to_string();
+        assert!(
+            message.contains("ignore"),
+            "names the field to edit: {message}"
+        );
+        assert!(
+            !message.contains("123456789"),
+            "the identity is personal data and the bind path logs this error: {message}"
+        );
+
+        let cfg = config.read();
+        assert_eq!(
+            cfg.peer_groups
+                .get("telegram_default")
+                .expect("group untouched")
+                .external_peers
+                .len(),
+            1,
+            "no second, equally shadowed grant was appended"
+        );
+        assert!(!crate::allowlist::is_user_allowed(
+            &cfg.channel_external_peers("telegram", "default"),
+            "123456789",
+            crate::allowlist::Match::Sensitive,
+        ));
     }
 
     #[test]

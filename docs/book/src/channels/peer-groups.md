@@ -83,7 +83,15 @@ reachable account.
 For the same reason, "is the list empty" is not "has anybody been authorized". A
 group with `ignore` and no `external_peers` resolves to a non-empty list that
 grants no one, so a channel deciding whether it is still unpaired asks
-`allowlist::grants_anyone` rather than testing the list for emptiness.
+`allowlist::grants_anyone` rather than testing the list for emptiness. A grant
+its own `ignore` cancels does not count either: `external_peers = ["alice"]`
+with `ignore = ["alice"]`, or `["*"]` with `ignore = ["*"]`, authorizes nobody,
+so the channels that gate pairing on that answer keep offering their bind code.
+
+Pairing then writes into `external_peers`, which means the same `ignore` can
+shadow what pairing just persisted. Rather than report a bind that cannot work,
+the write is refused and the operator is told to remove the `ignore` entry
+first. An explicit blocklist entry stays authoritative over a pairing attempt.
 
 Cross-agent routing is agent-scoped: for a given agent, the runtime walks every
 group the agent appears in, unions the other members' aliases on the group's

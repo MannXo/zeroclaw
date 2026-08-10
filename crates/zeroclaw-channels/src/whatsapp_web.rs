@@ -405,7 +405,8 @@ impl WhatsAppWebChannel {
         // its numbers is not sidestepped by another number of the same sender.
         // Only then pick the number to report downstream.
         let candidate_refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
-        let allowed_phone = if Self::are_numbers_allowed_for_list(allowed_numbers, &candidate_refs) {
+        let allowed_phone = if Self::are_numbers_allowed_for_list(allowed_numbers, &candidate_refs)
+        {
             candidates
                 .iter()
                 .find(|candidate| Self::is_number_allowed_for_list(allowed_numbers, candidate))
