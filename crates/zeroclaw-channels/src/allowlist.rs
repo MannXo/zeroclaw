@@ -120,22 +120,6 @@ fn is_user_denied(allowed: &[String], user: &str, match_fn: &impl Fn(&str, &str)
         .any(|entry| deny_names(entry, user, match_fn))
 }
 
-/// Whether `user` is explicitly denied, independent of any grant.
-///
-/// Needed by channels that accept more than one identifier for the same
-/// account. Asking `is_user_allowed_by` per identifier is not sufficient
-/// there: a deny on one alias is defeated by a wildcard grant reached through
-/// another, so the sender has to be rejected when *any* of its identifiers is
-/// denied.
-#[must_use]
-pub fn is_user_denied_by(
-    allowed: &[String],
-    user: &str,
-    match_fn: impl Fn(&str, &str) -> bool,
-) -> bool {
-    is_user_denied(allowed, user, &match_fn)
-}
-
 fn matcher_for(mode: Match) -> impl Fn(&str, &str) -> bool {
     move |entry: &str, user: &str| match mode {
         Match::Sensitive => entry == user,
@@ -143,10 +127,14 @@ fn matcher_for(mode: Match) -> impl Fn(&str, &str) -> bool {
     }
 }
 
-/// Whether any identifier of one account is explicitly denied.
+/// Whether any identifier of one account is explicitly denied, independent of
+/// any grant.
 ///
-/// The plural of `is_user_denied_by`, for channels that learn several
-/// identifiers for the same sender at once.
+/// Needed by channels that accept more than one identifier for the same
+/// account. Asking `is_user_allowed_by` per identifier is not sufficient
+/// there: a deny on one alias is defeated by a wildcard grant reached through
+/// another, so the sender has to be rejected when *any* of its identifiers is
+/// denied.
 #[must_use]
 pub fn is_identity_denied_by(
     allowed: &[String],
