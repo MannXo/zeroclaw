@@ -213,6 +213,39 @@ mod tests {
     }
 
     #[test]
+    fn delete_previous_word_answers_to_both_ctrl_w_and_alt_backspace() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        // Both chords resolve to the one action, so the existing
+        // Unicode-aware deletion stays the single behavior owner.
+        assert_eq!(
+            InputBarAction::from_chord(&KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)),
+            Some(InputBarAction::DeletePreviousWord)
+        );
+        assert_eq!(
+            InputBarAction::from_chord(&KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT)),
+            Some(InputBarAction::DeletePreviousWord)
+        );
+
+        // Unmodified Backspace keeps its own action rather than falling
+        // through to the word delete.
+        assert_eq!(
+            InputBarAction::from_chord(&KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            Some(InputBarAction::Backspace)
+        );
+
+        // Help and the rebinding surface read the defaults, so both chords
+        // have to be advertised there, not just accepted at match time.
+        let defaults = InputBarAction::DeletePreviousWord.default_chords();
+        assert!(defaults.contains(&Chord::ctrl('w')));
+        assert!(defaults.contains(&Chord::with(KeyCode::Backspace, KeyModifiers::ALT)));
+        assert_eq!(
+            action_key_labels(InputBarAction::DeletePreviousWord).len(),
+            2
+        );
+    }
+
+    #[test]
     fn no_intra_enum_chord_conflicts() {
         fn check<A: Copy + std::fmt::Debug>(label: &str, table: Vec<(Chord, A)>) {
             for (i, (c1, a1)) in table.iter().enumerate() {
