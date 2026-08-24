@@ -632,45 +632,18 @@ impl WhatsAppWebChannel {
         crate::allowlist::is_identity_allowed_by(allowed_numbers, phones, Self::phone_matches)
     }
 
-    /// Whether a config entry and a phone-like value name the same account.
-    ///
-    /// A raw number, a `+` number and a JID are three spellings of one
-    /// WhatsApp account, so admission and paired-identity persistence must
-    /// both canonicalize before comparing: a deny written as a JID has to
-    /// shadow a grant written as `+E.164`, in the writer as well as at
-    /// message time.
+    /// Both WhatsApp surfaces admit the same accounts, so the raw / `+E.164` /
+    /// JID identity rule lives once in [`crate::whatsapp`] and both call it.
+    /// Keeping a second copy here let the two drift, and the Cloud webhook was
+    /// left comparing exactly while this path canonicalized.
     #[cfg(feature = "whatsapp-web")]
     fn phone_matches(entry: &str, phone: &str) -> bool {
-        match (
-            Self::normalize_phone_token(entry),
-            Self::normalize_phone_token(phone),
-        ) {
-            (Some(entry_norm), Some(phone_norm)) => entry_norm == phone_norm,
-            _ => false,
-        }
+        crate::whatsapp::phone_matches(entry, phone)
     }
 
-    /// Normalize a phone-like token to canonical E.164 (`+<digits>`).
-    /// Accepts raw numbers, `+` numbers, and JIDs (uses the user part before `@`).
     #[cfg(feature = "whatsapp-web")]
     fn normalize_phone_token(value: &str) -> Option<String> {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-
-        let user_part = trimmed
-            .split_once('@')
-            .map(|(user, _)| user)
-            .unwrap_or(trimmed)
-            .trim();
-
-        let digits: String = user_part.chars().filter(|c| c.is_ascii_digit()).collect();
-        if digits.is_empty() {
-            None
-        } else {
-            Some(format!("+{digits}"))
-        }
+        crate::whatsapp::normalize_phone_token(value)
     }
 
     #[cfg(feature = "whatsapp-web")]
