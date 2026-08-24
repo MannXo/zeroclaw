@@ -4270,6 +4270,102 @@ mod tests {
         );
     }
 
+    /// Trust-boundary regression: an `ignore` naming the identity outranks the
+    /// grant a bind writes, so the endpoint must say so rather than answer
+    /// `saved` for a peer the running channel still rejects. The shared bind
+    /// core appended the grant and returned `Ok(true)`, and this handler
+    /// reported success on it.
+    #[tokio::test]
+    async fn channel_bind_refuses_an_identity_an_ignore_denies() {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = config_with_telegram_alias(&tmp, "alerts");
+        config.peer_groups.insert(
+            "telegram_alerts_blocked".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("telegram.alerts".to_string()),
+                ignore: vec![PeerUsername::new("123456789".to_string())],
+                ..PeerGroupConfig::default()
+            },
+        );
+        let state = test_state(config);
+
+        let (status, json) = response_json(
+            handle_api_channel_bind(
+                axum::extract::State(state.clone()),
+                axum::http::HeaderMap::new(),
+                axum::Json(ChannelBindBody {
+                    channel_type: "telegram".to_string(),
+                    alias: "alerts".to_string(),
+                    identity: "123456789".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let message = json.to_string();
+        assert!(
+            message.contains("ignore"),
+            "the operator has to be told what to edit, got: {message}"
+        );
+        assert!(
+            state
+                .config
+                .read()
+                .peer_groups
+                .get("telegram_alerts")
+                .is_none_or(|g| g.external_peers.is_empty()),
+            "a refused bind must not mutate the peer group"
+        );
+    }
+
+    /// The inverse: an unrelated `ignore` must not block a legitimate bind, or
+    /// the deny check would have turned the endpoint off.
+    #[tokio::test]
+    async fn channel_bind_still_binds_an_unignored_identity() {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = config_with_telegram_alias(&tmp, "alerts");
+        config.peer_groups.insert(
+            "telegram_alerts_blocked".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("telegram.alerts".to_string()),
+                ignore: vec![PeerUsername::new("999999999".to_string())],
+                ..PeerGroupConfig::default()
+            },
+        );
+        let state = test_state(config);
+
+        let (status, _json) = response_json(
+            handle_api_channel_bind(
+                axum::extract::State(state.clone()),
+                axum::http::HeaderMap::new(),
+                axum::Json(ChannelBindBody {
+                    channel_type: "telegram".to_string(),
+                    alias: "alerts".to_string(),
+                    identity: "123456789".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            state
+                .config
+                .read()
+                .channel_external_peers("telegram", "alerts")
+                .contains(&"123456789".to_string())
+        );
+    }
+
     #[tokio::test]
     async fn refresh_context_window_forwards_api_key() {
         use http_body_util::BodyExt;

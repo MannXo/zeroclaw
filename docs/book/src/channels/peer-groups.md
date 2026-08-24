@@ -92,6 +92,10 @@ Pairing then writes into `external_peers`, which means the same `ignore` can
 shadow what pairing just persisted. Rather than report a bind that cannot work,
 the write is refused and the operator is told to remove the `ignore` entry
 first. An explicit blocklist entry stays authoritative over a pairing attempt.
+This holds for every writer: an in-channel `/bind` exchange, `zeroclaw channel
+bind-telegram`, and `POST /api/channels/bind` all refuse it, and the refusal
+covers an identity already listed as a grant, because a grant its own `ignore`
+shadows is not a usable binding either.
 
 Cross-agent routing is agent-scoped: for a given agent, the runtime walks every
 group the agent appears in, unions the other members' aliases on the group's
