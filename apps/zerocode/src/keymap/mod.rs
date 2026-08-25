@@ -79,10 +79,15 @@ pub fn reserved_chords() -> &'static [(Chord, &'static str)] {
 
 /// Whether `chord` is a reserved bare control chord; returns the reason
 /// when it is, so the capture widget can explain the rejection.
+///
+/// Compared with `same_key`: `strip_redundant_shift` drops `SHIFT` from every
+/// character chord on every platform, so `shift+space` is the reserved
+/// selection-toggle key at dispatch and an `Eq` test would have let the capture
+/// widget bind it.
 pub fn reserved_reason(chord: &Chord) -> Option<&'static str> {
     reserved_chords()
         .iter()
-        .find_map(|(c, reason)| (c == chord).then_some(*reason))
+        .find_map(|(c, reason)| c.same_key(chord).then_some(*reason))
 }
 
 pub fn match_chord<A: Copy>(table: &[(Chord, A)], event: &KeyEvent) -> Option<A> {
@@ -306,6 +311,24 @@ mod tests {
         overrides::set_active(table);
         body();
         overrides::reset();
+    }
+
+    /// The capture widget refuses reserved chords, and that refusal has to use
+    /// dispatch semantics too. `strip_redundant_shift` drops `SHIFT` from every
+    /// character chord on every platform, so `shift+space` *is* the reserved
+    /// selection-toggle key once it reaches `match_chord`. An `Eq` test let the
+    /// widget bind it and the binding then did something else.
+    #[test]
+    fn reserved_reason_sees_a_normalized_spelling() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        assert!(reserved_reason(&Chord::char(' ')).is_some());
+        assert!(
+            reserved_reason(&Chord::with(KeyCode::Char(' '), KeyModifiers::SHIFT)).is_some(),
+            "shift+space normalizes to the reserved space chord"
+        );
+        // Still narrow: an unreserved chord stays bindable.
+        assert!(reserved_reason(&Chord::char('x')).is_none());
+        assert!(reserved_reason(&Chord::ctrl('w')).is_none());
     }
 
     /// `same_key` has to answer exactly what dispatch would: two chords are one
