@@ -308,6 +308,81 @@ mod tests {
         overrides::reset();
     }
 
+    /// `same_key` has to answer exactly what dispatch would: two chords are one
+    /// chord iff either matches the event the other describes. Asserted on both
+    /// platforms, so the Linux run still pins the contract even though only
+    /// darwin makes the ctrl/super pair equivalent.
+    #[test]
+    fn same_key_agrees_with_dispatch() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let pairs = [
+            (
+                Chord::ctrl('a'),
+                Chord::with(KeyCode::Char('a'), KeyModifiers::SUPER),
+            ),
+            // Host-reserved on darwin, so CONTROL is never rewritten for it.
+            (
+                Chord::ctrl('c'),
+                Chord::with(KeyCode::Char('c'), KeyModifiers::SUPER),
+            ),
+            (Chord::ctrl('a'), Chord::ctrl('a')),
+            (Chord::ctrl('a'), Chord::ctrl('b')),
+            (
+                Chord::with(KeyCode::Backspace, KeyModifiers::ALT),
+                Chord::with(KeyCode::Backspace, KeyModifiers::ALT),
+            ),
+            (
+                Chord::with(KeyCode::Backspace, KeyModifiers::ALT),
+                Chord::ctrl('w'),
+            ),
+        ];
+        for (a, b) in pairs {
+            let as_event = KeyEvent::new(b.code, b.modifiers);
+            assert_eq!(
+                a.same_key(&b),
+                a.matches(&as_event),
+                "same_key disagreed with matches for {} vs {}",
+                a.wire(),
+                b.wire()
+            );
+            assert_eq!(a.same_key(&b), b.same_key(&a), "same_key must be symmetric");
+        }
+    }
+
+    /// The darwin-only half of the precedence contract. `normalise_mods`
+    /// rewrites CONTROL to SUPER for every chord the host has not reserved, so
+    /// an operator's explicit `super+a` and the earlier-declared
+    /// `OpenFileBrowser`'s retained `ctrl+a` default are one chord at dispatch
+    /// and two on the wire. Comparing raw values left the shadowed default in
+    /// the table, and the operator's own binding lost to it by declaration
+    /// order while Help advertised the chord twice.
+    ///
+    /// Only meaningful on darwin: elsewhere the two chords really are distinct
+    /// and there is nothing to arbitrate. `same_key_agrees_with_dispatch` is
+    /// the part that runs everywhere.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_super_override_outranks_a_normalized_ctrl_default_on_darwin() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let super_a = Chord::with(KeyCode::Char('a'), KeyModifiers::SUPER);
+
+        with_input_bar_override("delete_previous_word", vec![super_a.clone()], || {
+            assert_eq!(
+                InputBarAction::from_chord(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SUPER)),
+                Some(InputBarAction::DeletePreviousWord),
+                "the operator's explicit binding must win over a normalized default"
+            );
+            assert!(
+                !action_key_labels(InputBarAction::OpenFileBrowser).contains(&super_a.display()),
+                "the shadowed ctrl+a default must leave Help too"
+            );
+            assert_eq!(
+                action_key_labels(InputBarAction::DeletePreviousWord),
+                vec![super_a.display()]
+            );
+        });
+    }
+
     #[test]
     fn an_explicit_binding_outranks_a_retained_default_on_another_action() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

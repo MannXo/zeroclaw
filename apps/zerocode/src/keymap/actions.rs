@@ -74,6 +74,12 @@ macro_rules! keyactions {
             /// default chord would silently take a chord the operator had
             /// already assigned elsewhere, because dispatch takes the first
             /// match in declaration order.
+            ///
+            /// The claim is tested with `Chord::same_key`, not `==`: dispatch
+            /// compares platform-normalised modifiers, so on darwin an explicit
+            /// `super+a` and a retained `ctrl+a` are one chord there and two
+            /// here. Raw equality left the shadowed default in the table and
+            /// the operator's own binding lost to it.
             pub fn resolved_bindings() -> Vec<(Chord, $name)> {
                 let Some(over) = super::overrides::lookup(Self::TAG) else {
                     return Self::bindings();
@@ -91,7 +97,7 @@ macro_rules! keyactions {
                         None => v
                             .default_chords()
                             .into_iter()
-                            .filter(|c| !claimed.contains(c))
+                            .filter(|c| !claimed.iter().any(|k| k.same_key(c)))
                             .collect(),
                     };
                     for c in chords {

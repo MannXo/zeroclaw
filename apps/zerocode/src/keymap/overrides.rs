@@ -51,7 +51,8 @@ pub fn set_row(tag: &str, variant: &str, chords: Vec<Chord>) {
 /// claims, so both explicit rows survive it, dispatch falls through to
 /// declaration order, and the Help surface advertises the chord for both
 /// actions. Checked against the live table rather than the file so a row
-/// installed earlier in the same session counts.
+/// installed earlier in the same session counts, and with `Chord::same_key`
+/// rather than `==` so a pair that only dispatch can tell apart still collides.
 #[must_use]
 pub fn conflicting_row(tag: &str, variant: &str, chords: &[Chord]) -> Option<(Chord, String)> {
     let rows = lookup(tag)?;
@@ -62,7 +63,7 @@ pub fn conflicting_row(tag: &str, variant: &str, chords: &[Chord]) -> Option<(Ch
         let mut owners: Vec<&String> = rows
             .iter()
             .filter(|(other, other_chords)| {
-                other.as_str() != variant && other_chords.contains(chord)
+                other.as_str() != variant && other_chords.iter().any(|owned| owned.same_key(chord))
             })
             .map(|(other, _)| other)
             .collect();

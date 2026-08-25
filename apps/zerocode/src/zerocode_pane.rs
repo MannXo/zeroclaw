@@ -2270,6 +2270,38 @@ mod tests {
         crate::keymap::overrides::reset();
     }
 
+    /// The editor half of the darwin normalization case. `ctrl+a` and `super+a`
+    /// are one chord at dispatch there, so capturing `super+a` for an action
+    /// while another explicit row owns `ctrl+a` would install two rows that
+    /// only the dispatcher can tell apart.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn binding_editor_refuses_a_normalized_collision_on_darwin() {
+        let _g = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        given_explicit_row("input_bar.clear_input", vec![Chord::ctrl('a')]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+        let row = focus_binding(&mut pane, "input_bar.delete_previous_word");
+        pane.capture = Some(Capture { row, error: None });
+        pane.handle_capture_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SUPER));
+
+        let status = pane.status().unwrap_or_default().to_string();
+        assert!(
+            status.contains("refused") && status.contains("clear_input"),
+            "a chord that only differs on the wire must still collide, got: {status:?}"
+        );
+        assert_eq!(
+            InputBarAction::from_chord(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SUPER)),
+            Some(InputBarAction::ClearInput),
+            "the existing binding must keep the key"
+        );
+        crate::keymap::overrides::reset();
+    }
+
     /// The inverse, so the guard cannot pass by refusing everything: a chord
     /// nobody else owns still installs.
     #[test]
