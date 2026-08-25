@@ -41,6 +41,38 @@ pub fn set_row(tag: &str, variant: &str, chords: Vec<Chord>) {
     }
 }
 
+/// The `(chord, variant)` an already-explicit row would collide with if
+/// `chords` were installed for `tag.variant`, or `None` when the row is safe.
+///
+/// `build_override_table` rejects this for a whole table read from config, but
+/// the binding editor installs one row at a time and never consults the rest of
+/// the table. Two *explicit* owners of one chord are arbitrated nowhere:
+/// `resolved_bindings` only drops a **retained default** that an override
+/// claims, so both explicit rows survive it, dispatch falls through to
+/// declaration order, and the Help surface advertises the chord for both
+/// actions. Checked against the live table rather than the file so a row
+/// installed earlier in the same session counts.
+#[must_use]
+pub fn conflicting_row(tag: &str, variant: &str, chords: &[Chord]) -> Option<(Chord, String)> {
+    let rows = lookup(tag)?;
+    // Deterministic: the map iterates arbitrarily, so report the collision the
+    // caller's own chord order reaches first rather than whichever row the
+    // hasher happens to yield.
+    chords.iter().find_map(|chord| {
+        let mut owners: Vec<&String> = rows
+            .iter()
+            .filter(|(other, other_chords)| {
+                other.as_str() != variant && other_chords.contains(chord)
+            })
+            .map(|(other, _)| other)
+            .collect();
+        owners.sort();
+        owners
+            .first()
+            .map(|other| (chord.clone(), (*other).clone()))
+    })
+}
+
 /// Drop the active table so a test starts from compile-time defaults.
 /// Hold [`TEST_GUARD`] across the call.
 #[cfg(test)]
