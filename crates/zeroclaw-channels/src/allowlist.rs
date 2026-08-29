@@ -17,6 +17,7 @@ pub enum Match {
 /// spellings name the same account. Re-exported from the producing crate so the
 /// two halves of the contract cannot drift.
 pub use zeroclaw_config::schema::PEER_DENY_PREFIX as DENY_PREFIX;
+use zeroclaw_config::schema::{peer_deny_identity, peer_grant_identity};
 
 /// Whether a resolved peer list can admit anybody at all.
 ///
@@ -38,7 +39,7 @@ pub use zeroclaw_config::schema::PEER_DENY_PREFIX as DENY_PREFIX;
 pub fn grants_anyone(allowed: &[String]) -> bool {
     let denies: Vec<&str> = allowed
         .iter()
-        .filter_map(|entry| entry.strip_prefix(DENY_PREFIX))
+        .filter_map(|entry| peer_deny_identity(entry))
         .collect();
     // `ignore = ["*"]` denies every sender, so no grant survives it.
     if denies.iter().any(|entry| is_wildcard(entry)) {
@@ -46,7 +47,7 @@ pub fn grants_anyone(allowed: &[String]) -> bool {
     }
     allowed
         .iter()
-        .filter(|entry| !entry.starts_with(DENY_PREFIX))
+        .filter_map(|entry| peer_grant_identity(entry))
         .any(|grant| {
             // A wildcard grant outlives any named deny: every sender the denies
             // do not name still rides it.
@@ -116,7 +117,7 @@ fn deny_names(entry: &str, user: &str, match_fn: &impl Fn(&str, &str) -> bool) -
 fn is_user_denied(allowed: &[String], user: &str, match_fn: &impl Fn(&str, &str) -> bool) -> bool {
     allowed
         .iter()
-        .filter_map(|entry| entry.strip_prefix(DENY_PREFIX))
+        .filter_map(|entry| peer_deny_identity(entry))
         .any(|entry| deny_names(entry, user, match_fn))
 }
 
@@ -177,9 +178,9 @@ pub fn is_identity_allowed_by(
     let grants = || {
         allowed
             .iter()
-            .filter(|entry| !entry.starts_with(DENY_PREFIX))
+            .filter_map(|entry| peer_grant_identity(entry))
     };
-    if grants().any(|entry| is_wildcard(entry)) {
+    if grants().any(is_wildcard) {
         return true;
     }
     grants().any(|entry| identities.iter().any(|user| match_fn(entry, user)))
@@ -291,6 +292,33 @@ mod tests {
         let partial = vec!["alice".to_string(), "bob".to_string(), "!alice".to_string()];
         assert!(grants_anyone(&partial));
         assert!(is_user_allowed(&partial, "bob", Match::Sensitive));
+    }
+
+    #[test]
+    fn a_grant_whose_identity_opens_with_the_deny_prefix_is_still_a_grant() {
+        // RFC 5322 allows `!` to open an email local-part, so the deny encoding
+        // must not swallow one. The resolver doubles the prefix on the way out;
+        // a single `!` stays a deny.
+        let resolved = vec![
+            "!!user@example.com".to_string(),
+            "!blocked@example.com".to_string(),
+        ];
+        assert!(
+            is_user_allowed(&resolved, "!user@example.com", Match::Sensitive),
+            "the escaped grant authorizes the address the operator wrote"
+        );
+        assert!(
+            !is_user_allowed(&resolved, "user@example.com", Match::Sensitive),
+            "the grant names the `!`-prefixed address, not the bare one"
+        );
+        assert!(
+            !is_user_allowed(&resolved, "blocked@example.com", Match::Sensitive),
+            "a single leading `!` is still a deny"
+        );
+        assert!(
+            grants_anyone(&resolved),
+            "an escaped grant is authorization, so pairing is not re-offered"
+        );
     }
 
     #[test]

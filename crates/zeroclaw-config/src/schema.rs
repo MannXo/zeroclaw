@@ -19616,6 +19616,51 @@ struct ExtraNestedModelProviderTable {
 /// granted, so the reservation fails closed.
 pub const PEER_DENY_PREFIX: char = '!';
 
+/// The grant identity `entry` names, or `None` when `entry` is a deny marker.
+///
+/// A grant whose own text begins with `PEER_DENY_PREFIX` travels doubled, so
+/// the encoding stays unambiguous: RFC 5322 permits `!` to open an email
+/// local-part, and `!user@example.com` is a legitimate address an operator may
+/// grant. Without the escape the resolver would emit it as a deny of
+/// `user@example.com` — inverting the operator's intent on a surface whose
+/// whole job is authorization. Pairs with `peer_deny_marker`.
+#[must_use]
+pub fn peer_grant_identity(entry: &str) -> Option<&str> {
+    match entry.strip_prefix(PEER_DENY_PREFIX) {
+        // `!!name` is the escaped grant for the literal `!name`.
+        Some(rest) => rest.strip_prefix(PEER_DENY_PREFIX).map(|_| &entry[1..]),
+        None => Some(entry),
+    }
+}
+
+/// The identity `entry` denies, or `None` when `entry` is a grant.
+#[must_use]
+pub fn peer_deny_identity(entry: &str) -> Option<&str> {
+    let rest = entry.strip_prefix(PEER_DENY_PREFIX)?;
+    // A doubled prefix is an escaped grant, not a deny.
+    if rest.starts_with(PEER_DENY_PREFIX) {
+        return None;
+    }
+    Some(rest)
+}
+
+/// Encode `identity` as a grant entry, doubling a leading
+/// `PEER_DENY_PREFIX` so it cannot be read as a deny marker.
+#[must_use]
+pub fn peer_grant_marker(identity: &str) -> String {
+    if identity.starts_with(PEER_DENY_PREFIX) {
+        format!("{PEER_DENY_PREFIX}{identity}")
+    } else {
+        identity.to_string()
+    }
+}
+
+/// Encode `identity` as a deny marker.
+#[must_use]
+pub fn peer_deny_marker(identity: &str) -> String {
+    format!("{PEER_DENY_PREFIX}{identity}")
+}
+
 /// Classification of a `peer_groups.<name>.channel` reference against the
 /// configured `[channels.*]` blocks. This is the single source of truth for
 /// resolving a raw `channel` string — `Config::validate()` consumes it for
@@ -19699,7 +19744,7 @@ impl Config {
         let mut out: Vec<String> = matching_groups
             .iter()
             .flat_map(|group| &group.external_peers)
-            .map(|peer| peer.as_str().to_string())
+            .map(|peer| peer_grant_marker(peer.as_str()))
             .collect();
         out.sort();
         out.dedup();
@@ -19716,7 +19761,7 @@ impl Config {
         out.extend(
             denied
                 .into_iter()
-                .map(|peer| format!("{PEER_DENY_PREFIX}{peer}")),
+                .map(|peer| peer_deny_marker(peer.as_str())),
         );
         out
     }
@@ -19730,7 +19775,7 @@ impl Config {
         let resolved = self.channel_external_peers(channel_type, alias);
         let denied: std::collections::HashSet<String> = resolved
             .iter()
-            .filter_map(|peer| peer.strip_prefix(PEER_DENY_PREFIX))
+            .filter_map(|peer| peer_deny_identity(peer))
             .map(|peer| peer.trim().trim_start_matches('@').to_lowercase())
             .collect();
         // `ignore = ["*"]` denies every sender, so it leaves nothing
@@ -19742,10 +19787,10 @@ impl Config {
         }
         resolved
             .iter()
-            .filter(|peer| !peer.starts_with(PEER_DENY_PREFIX))
+            .filter_map(|peer| peer_grant_identity(peer))
             .filter(|peer| peer.trim() != "*")
             .filter(|peer| !denied.contains(&peer.trim().trim_start_matches('@').to_lowercase()))
-            .cloned()
+            .map(str::to_string)
             .collect()
     }
 
@@ -24981,6 +25026,46 @@ mod tests {
         assert_eq!(
             config.channel_external_peers("reddit", "ops"),
             vec!["u/alice".to_string(), "!alice".to_string()]
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_external_peers_escapes_a_grant_that_opens_with_the_deny_prefix() {
+        // RFC 5322 allows `!` to open an email local-part. Emitted raw, the
+        // grant would read back as a deny of `user@example.com` and invert the
+        // operator's intent on the surface whose whole job is authorization.
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.email_ops]
+            channel = "email.ops"
+            external_peers = ["!user@example.com"]
+            ignore = ["blocked@example.com"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        let resolved = config.channel_external_peers("email", "ops");
+        assert_eq!(
+            resolved,
+            vec![
+                "!!user@example.com".to_string(),
+                "!blocked@example.com".to_string(),
+            ]
+        );
+        assert_eq!(
+            super::peer_grant_identity("!!user@example.com"),
+            Some("!user@example.com"),
+            "the escape round-trips to the address the operator wrote"
+        );
+        assert_eq!(super::peer_deny_identity("!!user@example.com"), None);
+        assert_eq!(
+            super::peer_deny_identity("!blocked@example.com"),
+            Some("blocked@example.com")
+        );
+        assert_eq!(
+            config.channel_addressable_peers("email", "ops"),
+            vec!["!user@example.com".to_string()],
+            "the escaped grant is a reachable address, unescaped"
         );
     }
 

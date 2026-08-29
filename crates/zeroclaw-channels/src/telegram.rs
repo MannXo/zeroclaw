@@ -1141,6 +1141,22 @@ impl TelegramChannel {
         self
     }
 
+    /// The conflict message when a matching `ignore` denies `identity`.
+    ///
+    /// Asked before `try_pair`, because pairing consumes the one-time code.
+    fn pairing_deny_conflict(&self, identity: &str) -> Option<String> {
+        let config = self.persist.as_ref()?;
+        let normalized = Self::normalize_identity(identity);
+        let cfg = config.read();
+        crate::identity_persist::external_peer_deny_conflict(
+            &cfg,
+            "telegram",
+            &self.alias,
+            &normalized,
+            |entry, user| Self::normalize_identity(entry) == user,
+        )
+    }
+
     async fn persist_allowed_identity(&self, identity: &str) -> anyhow::Result<()> {
         let Some(config) = &self.persist else {
             ::zeroclaw_log::record!(
@@ -1931,16 +1947,38 @@ impl TelegramChannel {
 
         if let Some(code) = Self::extract_bind_code(text) {
             if let Some(pairing) = self.pairing.as_ref() {
+                let bind_identity = normalized_sender_id.clone().or_else(|| {
+                    if normalized_username.is_empty() || normalized_username == "unknown" {
+                        None
+                    } else {
+                        Some(normalized_username.clone())
+                    }
+                });
+
+                // Before the pairing transition: a denied identity can never be
+                // persisted, and `try_pair` would spend the operator's only code
+                // to reach that verdict, leaving the sender no way to retry.
+                if let Some(identity) = bind_identity.as_deref()
+                    && let Some(conflict) = self.pairing_deny_conflict(identity)
+                {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"conflict": conflict})),
+                        "refusing bind before consuming pairing code"
+                    );
+                    let _ = self
+                        .send(&SendMessage::new(
+                            "❌ This account is denied by an `ignore` entry in the runtime config. Ask the operator to remove it, then retry with the same code.",
+                            &chat_id,
+                        ))
+                        .await;
+                    return;
+                }
+
                 match pairing.try_pair(code, &chat_id).await {
                     Ok(Some(_token)) => {
-                        let bind_identity = normalized_sender_id.clone().or_else(|| {
-                            if normalized_username.is_empty() || normalized_username == "unknown" {
-                                None
-                            } else {
-                                Some(normalized_username.clone())
-                            }
-                        });
-
                         if let Some(identity) = bind_identity {
                             match Box::pin(self.persist_allowed_identity(&identity)).await {
                                 Ok(()) => {
@@ -5843,6 +5881,86 @@ mod tests {
             "123456789",
             crate::allowlist::Match::Sensitive,
         ));
+    }
+
+    #[tokio::test]
+    async fn telegram_bind_keeps_the_one_time_code_when_an_ignore_denies_the_sender() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        // Pairing is irreversible: `try_pair` consumes the code and mints a
+        // token. A deny discovered after that spends the operator's only code
+        // on a pairing the admission matcher then rejects, and
+        // `pairing_code_active()` is false, so the sender cannot retry.
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&mock_server)
+            .await;
+
+        let config_with = |ignored: bool| {
+            let mut config = Config::default();
+            config.channels.telegram.insert(
+                "default".to_string(),
+                zeroclaw_config::schema::TelegramConfig {
+                    bot_token: "t".to_string(),
+                    ..Default::default()
+                },
+            );
+            config.peer_groups.insert(
+                "telegram_default".to_string(),
+                PeerGroupConfig {
+                    channel: ChannelRef::new("telegram.default".to_string()),
+                    ignore: if ignored {
+                        vec![PeerUsername::new("123456789".to_string())]
+                    } else {
+                        Vec::new()
+                    },
+                    ..Default::default()
+                },
+            );
+            Arc::new(RwLock::new(config))
+        };
+
+        let bind = |ignored: bool| {
+            let uri = mock_server.uri();
+            async move {
+                let ch = TelegramChannel::new("t".into(), "default", Arc::new(Vec::new), false)
+                    .with_persistence(config_with(ignored))
+                    .with_api_base(uri);
+                let code = ch
+                    .pairing
+                    .as_ref()
+                    .expect("no configured peers, so pairing is offered")
+                    .pairing_code()
+                    .expect("a fresh guard issues a code");
+                ch.handle_unauthorized_message(&serde_json::json!({
+                    "message": {
+                        "text": format!("/bind {code}"),
+                        "from": {"id": 123_456_789},
+                        "chat": {"id": 42},
+                    }
+                }))
+                .await;
+                ch.pairing
+                    .as_ref()
+                    .expect("guard outlives the handler")
+                    .pairing_code()
+            }
+        };
+
+        assert!(
+            bind(true).await.is_some(),
+            "a denied identity must not spend the operator's only pairing code"
+        );
+        // Control: the same handler on the same fixture *does* consume the code
+        // when nothing denies the sender, so the assertion above is not vacuous.
+        assert!(
+            bind(false).await.is_none(),
+            "an admissible identity still pairs and consumes the code"
+        );
     }
 
     #[test]

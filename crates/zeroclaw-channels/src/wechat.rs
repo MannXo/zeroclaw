@@ -1026,6 +1026,21 @@ impl WeChatChannel {
         crate::allowlist::is_user_allowed_by(&peers, user_id, Self::identity_matches)
     }
 
+    /// The conflict message when a matching `ignore` denies `identity`.
+    ///
+    /// Asked before `try_pair`, because pairing consumes the one-time code.
+    fn pairing_deny_conflict(&self, identity: &str) -> Option<String> {
+        let config = self.persist.as_ref()?;
+        let cfg = config.read();
+        crate::identity_persist::external_peer_deny_conflict(
+            &cfg,
+            "wechat",
+            &self.alias,
+            identity.trim(),
+            Self::identity_matches,
+        )
+    }
+
     async fn persist_allowed_identity(&self, identity: &str) -> anyhow::Result<()> {
         crate::identity_persist::persist_external_peer(
             self.persist.as_ref(),
@@ -2127,6 +2142,22 @@ impl WeChatChannel {
     async fn handle_unauthorized_message(&self, from_user_id: &str, text: &str) {
         if let Some(code) = Self::extract_bind_code(text) {
             if let Some(pairing) = self.pairing.as_ref() {
+                // Before the pairing transition: a denied identity can never be
+                // persisted, and `try_pair` would spend the operator's only code
+                // to reach that verdict, leaving the sender no way to retry.
+                if let Some(conflict) = self.pairing_deny_conflict(from_user_id) {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"conflict": conflict})),
+                        "refusing bind before consuming pairing code"
+                    );
+                    let ctx = self.get_context_token(from_user_id);
+                    let reply = wechat_cli_string("cli-wechat-bind-denied");
+                    let _ = self.send_text(from_user_id, &reply, ctx.as_deref()).await;
+                    return;
+                }
                 match pairing.try_pair(code, from_user_id).await {
                     Ok(Some(_token)) => {
                         if let Err(e) = self.persist_allowed_identity(from_user_id).await {
@@ -2964,6 +2995,87 @@ mod tests {
         assert!(
             channel_over(&config).is_user_allowed("user1@im.wechat"),
             "the paired identity is admissible under the channel's own matcher"
+        );
+    }
+
+    #[tokio::test]
+    async fn wechat_bind_keeps_the_one_time_code_when_an_ignore_denies_the_sender() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        // `try_pair` consumes the code and mints a token before any deny is
+        // consulted; discovering the deny afterwards leaves the operator's only
+        // code spent on a pairing the admission matcher rejects.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ret": 0})))
+            .mount(&server)
+            .await;
+        let state_dir = tempfile::tempdir().expect("temp state dir");
+
+        let build = |ignored: bool| {
+            let mut config = zeroclaw_config::schema::Config::default();
+            config.channels.wechat.insert(
+                "admin".to_string(),
+                zeroclaw_config::schema::WeChatConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+            );
+            config.peer_groups.insert(
+                "wechat_admin".to_string(),
+                PeerGroupConfig {
+                    channel: ChannelRef::new("wechat.admin".to_string()),
+                    ignore: if ignored {
+                        vec![PeerUsername::new("USER1@im.wechat".to_string())]
+                    } else {
+                        Vec::new()
+                    },
+                    ..Default::default()
+                },
+            );
+            // An empty resolver, so the guard is created and a code issued.
+            let mut channel = WeChatChannel::new(
+                "admin",
+                Arc::new(Vec::new),
+                None,
+                None,
+                Some(state_dir.path().to_path_buf()),
+            )
+            .expect("channel builds")
+            .with_persistence(Arc::new(parking_lot::RwLock::new(config)));
+            channel.api_base_url = server.uri();
+            *channel.bot_token.write().unwrap() = Some("test-token".into());
+            channel
+        };
+
+        let bind = |ignored: bool| async move {
+            let ch = build(ignored);
+            let code = ch
+                .pairing
+                .as_ref()
+                .expect("no configured peers, so pairing is offered")
+                .pairing_code()
+                .expect("a fresh guard issues a code");
+            ch.handle_unauthorized_message("USER1@im.wechat", &format!("/bind {code}"))
+                .await;
+            ch.pairing
+                .as_ref()
+                .expect("guard outlives the handler")
+                .pairing_code()
+        };
+
+        assert!(
+            bind(true).await.is_some(),
+            "a denied identity must not spend the operator's only pairing code"
+        );
+        // Control: without the deny the same handler consumes the code, so the
+        // assertion above is not vacuous.
+        assert!(
+            bind(false).await.is_none(),
+            "an admissible identity still pairs and consumes the code"
         );
     }
 

@@ -22,6 +22,31 @@
 use std::sync::Arc;
 use zeroclaw_config::schema::Config;
 
+/// The conflict message when a matching `ignore` already denies `identity`,
+/// or `None` when a pairing write would take effect.
+///
+/// This is the deny half of `merge_external_peer`'s contract, split out so a
+/// handler can ask it *before* the pairing transition. `PairingGuard::try_pair`
+/// consumes the one-time code and mints a bearer token; discovering the deny
+/// only after that leaves the operator's single code spent on a pairing that
+/// can never admit the sender, with `pairing_code_active()` false and no route
+/// to retry. The writer delegates here too, so the pre-check and the write
+/// cannot disagree about what "denied" means.
+pub(crate) fn external_peer_deny_conflict(
+    cfg: &Config,
+    channel_type: &str,
+    alias: &str,
+    identity: &str,
+    match_fn: impl Fn(&str, &str) -> bool,
+) -> Option<String> {
+    let normalized = identity.trim();
+    if normalized.is_empty() {
+        return None;
+    }
+    let resolved = cfg.channel_external_peers(channel_type, alias);
+    crate::allowlist::pairing_deny_conflict(&resolved, channel_type, alias, normalized, match_fn)
+}
+
 /// Merge `identity` into the `external_peers` of the peer group whose
 /// `channel` ref matches `<channel_type>.<alias>`, on the canonical
 /// in-memory config. Returns `true` when the config changed (the caller
@@ -93,13 +118,9 @@ pub(crate) fn merge_external_peer(
 
     let resolved = cfg.channel_external_peers(channel_type, alias);
 
-    if let Some(conflict) = crate::allowlist::pairing_deny_conflict(
-        &resolved,
-        channel_type,
-        alias,
-        normalized,
-        &match_fn,
-    ) {
+    if let Some(conflict) =
+        external_peer_deny_conflict(cfg, channel_type, alias, normalized, &match_fn)
+    {
         anyhow::bail!(conflict);
     }
 

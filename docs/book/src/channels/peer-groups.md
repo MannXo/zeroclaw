@@ -58,10 +58,13 @@ account.
 A wildcard is recognized with surrounding whitespace trimmed, so `[" * "]` and
 `["*"]` mean the same thing to both halves of the rule.
 
-`!` is therefore reserved as the first character of an `external_peers` or
-`ignore` entry. No supported platform issues usernames beginning with `!`, and
-such an entry is read as a deny rather than a grant, so the reservation cannot
-widen access.
+`!` therefore opens a deny marker in the resolved list. An identity may legally
+begin with `!`, since RFC 5322 allows it in an email local-part, so a grant whose
+own text starts with `!` travels doubled. `external_peers = ["!user@example.com"]`
+resolves to `!!user@example.com`, which reads back as a grant for the literal
+`!user@example.com`. A single leading `!` is always a deny, a doubled one always
+a grant, and nothing an operator can write is silently inverted. You write the
+address as it is; the doubling is internal to the resolved list.
 
 A channel written more than one way in `channel` (WeCom WebSocket answers to
 both `wecom-ws` and `wecom_ws`) resolves as one set. Resolving each spelling on
