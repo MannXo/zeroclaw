@@ -19596,6 +19596,13 @@ impl Config {
             .filter_map(|peer| peer.strip_prefix(PEER_DENY_PREFIX))
             .map(|peer| peer.trim().trim_start_matches('@').to_lowercase())
             .collect();
+        // `ignore = ["*"]` denies every sender, so it leaves nothing
+        // addressable either. Subtracting only the names in the deny set misses
+        // it: a wildcard deny names nobody, so an ordinary grant survives it and
+        // heartbeat auto-detection would pick an account the policy rejects.
+        if denied.iter().any(|peer| peer == "*") {
+            return Vec::new();
+        }
         resolved
             .iter()
             .filter(|peer| !peer.starts_with(PEER_DENY_PREFIX))
@@ -19637,6 +19644,13 @@ impl Config {
                 }
             }
         }
+        // Voice delivery is delivery, so the same `ignore` that denies a sender
+        // has to remove them here. This walked `external_peers` directly and
+        // never consulted `ignore` at all, so an explicitly ignored peer still
+        // received proactive TTS. Filtered through the addressable view rather
+        // than re-deriving the rule, so the two cannot answer differently.
+        let addressable = self.channel_addressable_peers(channel_type, alias);
+        out.retain(|peer| addressable.iter().any(|allowed| allowed == peer));
         out
     }
 
@@ -24891,6 +24905,108 @@ mod tests {
             vec!["*".to_string(), "!*".to_string()]
         );
         assert!(config.channel_addressable_peers("reddit", "ops").is_empty());
+    }
+
+    /// The case the wildcard-grant test above does not reach. A wildcard deny
+    /// names nobody, so subtracting only the names in the deny set left an
+    /// ordinary grant standing. `auto_detect_heartbeat_channel` takes the first
+    /// addressable entry, so proactive output went to an account the policy
+    /// explicitly denies.
+    #[::core::prelude::v1::test]
+    fn wildcard_deny_leaves_no_named_grant_addressable() {
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.telegram_grant]
+            channel = "telegram"
+            external_peers = ["user123"]
+
+            [peer_groups.telegram_block]
+            channel = "telegram"
+            ignore = ["*"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        assert_eq!(
+            config.channel_external_peers("telegram", "ops"),
+            vec!["user123".to_string(), "!*".to_string()]
+        );
+        assert!(
+            config
+                .channel_addressable_peers("telegram", "ops")
+                .is_empty(),
+            "a wildcard deny leaves nothing to address"
+        );
+        // The admission side already agreed; this is the delivery side catching up.
+        assert!(
+            config
+                .channel_addressable_peers("telegram", "ops")
+                .is_empty()
+        );
+    }
+
+    /// A named deny still removes only that peer, so the wildcard-deny rule
+    /// above cannot pass by emptying the set for every policy.
+    #[::core::prelude::v1::test]
+    fn a_named_deny_leaves_other_grants_addressable() {
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.telegram_grant]
+            channel = "telegram"
+            external_peers = ["user123", "user456"]
+
+            [peer_groups.telegram_block]
+            channel = "telegram"
+            ignore = ["user123"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        assert_eq!(
+            config.channel_addressable_peers("telegram", "ops"),
+            vec!["user456".to_string()]
+        );
+    }
+
+    /// Voice delivery is delivery. This walked `external_peers` directly and
+    /// never consulted `ignore`, so an explicitly ignored peer still received
+    /// proactive TTS.
+    #[::core::prelude::v1::test]
+    fn voice_peers_drop_an_ignored_peer() {
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.telegram_voice]
+            channel = "telegram"
+            external_peers = ["user123", "user456"]
+            output_modality = "voice"
+
+            [peer_groups.telegram_block]
+            channel = "telegram"
+            ignore = ["user123"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        assert_eq!(
+            config.channel_voice_peers("telegram", "ops"),
+            vec!["user456".to_string()],
+            "an ignored peer must not receive proactive voice output"
+        );
+
+        let all_denied: super::Config = toml::from_str(
+            r#"
+            [peer_groups.telegram_voice]
+            channel = "telegram"
+            external_peers = ["user123"]
+            output_modality = "voice"
+
+            [peer_groups.telegram_block]
+            channel = "telegram"
+            ignore = ["*"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+        assert!(all_denied.channel_voice_peers("telegram", "ops").is_empty());
     }
 
     // ── Nextcloud Talk: one normalized bot secret for both directions ──

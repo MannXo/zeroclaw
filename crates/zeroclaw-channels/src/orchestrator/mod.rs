@@ -8652,9 +8652,6 @@ pub fn bind_channel_identity_into(
     alias: &str,
     identity: &str,
 ) -> Result<bool> {
-    use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
-    use zeroclaw_config::providers::ChannelRef;
-
     let Some(normalize) = channel_identity_normalizer(channel_type) else {
         anyhow::bail!(
             "Channel type `{channel_type}` does not support identity binding \
@@ -8679,44 +8676,20 @@ pub fn bind_channel_identity_into(
         );
     }
 
-    // An `ignore` naming this identity outranks the grant this function is
-    // about to write, so the write would persist something the admission
-    // matcher rejects and report success for it. The in-channel `/bind` writers
-    // refuse that; this core serves the CLI and the HTTP bind endpoint, and has
-    // to refuse it on the same terms or the operator is told an account is
-    // bound while it still cannot talk. Asked before the already-present check
-    // below: a grant a deny shadows is not a usable binding either, so the
-    // no-op answer would be just as false as the success one.
-    if let Some(conflict) = crate::allowlist::pairing_deny_conflict(
-        &config.channel_external_peers(channel_type, alias),
+    // Everything after the closed-set and alias gates is the shared paired
+    // identity write, so it goes through the one writer that selects its target
+    // the way the runtime reader selects it: by the group's `channel` field,
+    // never by the `peer_groups` map key. Keys are arbitrary, so a group keyed
+    // `telegram_alerts` may carry `channel = "telegram.other"`; opening it by
+    // key wrote the grant where this channel's reader never looks while another
+    // channel's reader picked it up, and still reported success.
+    crate::identity_persist::merge_external_peer(
+        config,
         channel_type,
         alias,
         &normalized,
         |entry, identity| normalize(entry) == normalize(identity),
-    ) {
-        anyhow::bail!(conflict);
-    }
-
-    let group_name = format!("{channel_type}_{alias}");
-    let channel_ref = format!("{channel_type}.{alias}");
-    let group = config
-        .peer_groups
-        .entry(group_name)
-        .or_insert_with(|| PeerGroupConfig {
-            channel: ChannelRef::new(channel_ref),
-            ..PeerGroupConfig::default()
-        });
-
-    if group
-        .external_peers
-        .iter()
-        .any(|p| normalize(p.as_str()) == normalized)
-    {
-        return Ok(false);
-    }
-
-    group.external_peers.push(PeerUsername::new(normalized));
-    Ok(true)
+    )
 }
 
 /// Telegram-specific thin wrapper over [`bind_channel_identity_into`], kept
@@ -31940,6 +31913,116 @@ This is an example JSON object for profile settings."#;
             "123456789",
             crate::allowlist::Match::Sensitive,
         ));
+    }
+
+    /// Peer-group map keys are arbitrary; the runtime authorizes by the
+    /// group's `channel` field. Selecting the write target by key therefore
+    /// appended the grant to whatever group happened to be named
+    /// `telegram_alerts`, even one bound to a different instance, and reported
+    /// success while the requested channel stayed unauthorized.
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_channel_into_does_not_write_through_a_mismatched_group_key() {
+        use zeroclaw_config::multi_agent::PeerGroupConfig;
+        use zeroclaw_config::providers::ChannelRef;
+
+        let mut config = config_with_telegram_alias("alerts");
+        config.channels.telegram.insert(
+            "other".to_string(),
+            config.channels.telegram["alerts"].clone(),
+        );
+        // Conventional key for `alerts`, but bound to `other`.
+        config.peer_groups.insert(
+            "telegram_alerts".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("telegram.other".to_string()),
+                ..PeerGroupConfig::default()
+            },
+        );
+
+        let err = bind_channel_identity_into(&mut config, "telegram", "alerts", "123456789")
+            .expect_err("the conventional key belongs to another channel");
+        assert!(
+            err.to_string().contains("telegram.other"),
+            "the error should name the channel ref that actually owns the key, got: {err}"
+        );
+        assert!(
+            config.peer_groups["telegram_alerts"]
+                .external_peers
+                .is_empty(),
+            "nothing may be written into another channel's group"
+        );
+        // And the other channel did not silently gain the peer either.
+        assert!(
+            config
+                .channel_external_peers("telegram", "other")
+                .is_empty()
+        );
+    }
+
+    /// The bare-type variant: a group keyed `telegram_alerts` carrying
+    /// `channel = "telegram"` reads for every alias, so appending there would
+    /// broaden the grant across all of them.
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_channel_into_refuses_a_bare_type_key_collision() {
+        use zeroclaw_config::multi_agent::PeerGroupConfig;
+        use zeroclaw_config::providers::ChannelRef;
+
+        let mut config = config_with_telegram_alias("alerts");
+        config.peer_groups.insert(
+            "telegram_alerts".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("telegram".to_string()),
+                ..PeerGroupConfig::default()
+            },
+        );
+
+        assert!(
+            bind_channel_identity_into(&mut config, "telegram", "alerts", "123456789").is_err()
+        );
+        assert!(
+            config.peer_groups["telegram_alerts"]
+                .external_peers
+                .is_empty(),
+            "a type-wide group must not be widened by an alias-scoped bind"
+        );
+    }
+
+    /// The write lands in the group the reader matches even when that group is
+    /// not the conventionally named one.
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_channel_into_writes_into_the_group_the_reader_matches() {
+        use zeroclaw_config::multi_agent::PeerGroupConfig;
+        use zeroclaw_config::providers::ChannelRef;
+
+        let mut config = config_with_telegram_alias("alerts");
+        config.peer_groups.insert(
+            "some_other_name".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("telegram.alerts".to_string()),
+                ..PeerGroupConfig::default()
+            },
+        );
+
+        assert!(
+            bind_channel_identity_into(&mut config, "telegram", "alerts", "123456789").unwrap()
+        );
+        assert_eq!(
+            config.peer_groups["some_other_name"].external_peers.len(),
+            1,
+            "the identity belongs in the group whose channel ref the reader matches"
+        );
+        assert!(
+            !config.peer_groups.contains_key("telegram_alerts"),
+            "no conventional group should be minted when one already reads for this channel"
+        );
+        assert!(
+            config
+                .channel_external_peers("telegram", "alerts")
+                .contains(&"123456789".to_string())
+        );
     }
 
     /// The closed-set gate: a non-pairing channel type cannot be bound.

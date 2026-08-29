@@ -4331,6 +4331,53 @@ mod tests {
         );
     }
 
+    /// The HTTP surface of the same rule: peer-group keys are arbitrary, so a
+    /// group named `telegram_alerts` may be bound to a different instance. The
+    /// endpoint must refuse rather than report `saved` for a write the
+    /// requested channel's reader never sees.
+    #[tokio::test]
+    async fn channel_bind_refuses_a_group_key_bound_to_another_channel() {
+        use zeroclaw_config::multi_agent::PeerGroupConfig;
+        use zeroclaw_config::providers::ChannelRef;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = config_with_telegram_alias(&tmp, "alerts");
+        config.peer_groups.insert(
+            "telegram_alerts".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("telegram.other".to_string()),
+                ..PeerGroupConfig::default()
+            },
+        );
+        let state = test_state(config);
+
+        let (status, json) = response_json(
+            handle_api_channel_bind(
+                axum::extract::State(state.clone()),
+                axum::http::HeaderMap::new(),
+                axum::Json(ChannelBindBody {
+                    channel_type: "telegram".to_string(),
+                    alias: "alerts".to_string(),
+                    identity: "123456789".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            json.to_string().contains("telegram.other"),
+            "the operator has to be told which group owns the key, got: {json}"
+        );
+        assert!(
+            state.config.read().peer_groups["telegram_alerts"]
+                .external_peers
+                .is_empty(),
+            "a refused bind must not write into another channel's group"
+        );
+    }
+
     /// The inverse: an unrelated `ignore` must not block a legitimate bind, or
     /// the deny check would have turned the endpoint off.
     #[tokio::test]

@@ -504,6 +504,22 @@ mod tests {
         assert!(ch.is_author_allowed(&["someone", "999"]));
     }
 
+    /// A tweet with no `author_id` yields `""`, and the username falls back to
+    /// that same empty value, so the gate saw a non-empty slice naming nobody
+    /// and the wildcard admitted it.
+    #[test]
+    fn twitter_wildcard_does_not_admit_a_blank_author() {
+        let ch = TwitterChannel::new(
+            "token".into(),
+            "twitter_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        );
+        assert!(!ch.is_author_allowed(&["", ""]));
+        assert!(!ch.is_author_allowed(&[" ", ""]));
+        // A usable identifier still authorizes, blank sibling or not.
+        assert!(ch.is_author_allowed(&["", "1234567890"]));
+    }
+
     #[test]
     fn twitter_deny_on_the_author_id_is_not_defeated_by_the_username() {
         let ch = TwitterChannel::new(

@@ -1109,8 +1109,6 @@ impl TelegramChannel {
     }
 
     async fn persist_allowed_identity(&self, identity: &str) -> anyhow::Result<()> {
-        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
-
         let Some(config) = &self.persist else {
             ::zeroclaw_log::record!(
                 WARN,
@@ -1125,41 +1123,22 @@ impl TelegramChannel {
         if normalized.is_empty() {
             anyhow::bail!("Cannot persist empty Telegram identity");
         }
-        let group_name = format!("telegram_{}", self.alias);
-        let channel_ref: zeroclaw_config::providers::ChannelRef =
-            format!("telegram.{}", self.alias).into();
+        // Through the shared writer, which selects its target group by the
+        // `channel` field the runtime reader authorizes by rather than by the
+        // `peer_groups` map key. Selecting by key wrote the grant into whatever
+        // group happened to be named `telegram_<alias>`, even one whose
+        // `channel` points at a different instance, and reported success.
         let snapshot = {
             let mut cfg = config.write();
-            if !cfg.channels.telegram.contains_key(&self.alias) {
-                anyhow::bail!(
-                    "Missing [channels.telegram.{}] section. Run `zeroclaw config set channels.telegram.<alias>.bot_token <token>` to configure.",
-                    self.alias
-                );
-            }
-            if let Some(conflict) = crate::allowlist::pairing_deny_conflict(
-                &cfg.channel_external_peers("telegram", &self.alias),
+            if !crate::identity_persist::merge_external_peer(
+                &mut cfg,
                 "telegram",
                 &self.alias,
                 &normalized,
                 |entry, user| Self::normalize_identity(entry) == user,
-            ) {
-                anyhow::bail!(conflict);
-            }
-            let group = cfg
-                .peer_groups
-                .entry(group_name)
-                .or_insert_with(|| PeerGroupConfig {
-                    channel: channel_ref,
-                    ..PeerGroupConfig::default()
-                });
-            if group
-                .external_peers
-                .iter()
-                .any(|p| Self::normalize_identity(p.as_str()) == normalized)
-            {
+            )? {
                 return Ok(());
             }
-            group.external_peers.push(PeerUsername::new(normalized));
             cfg.clone()
         };
         snapshot
@@ -1888,12 +1867,9 @@ impl TelegramChannel {
             return;
         };
 
-        let mut identities = vec![normalized_username.as_str()];
-        if let Some(ref id) = normalized_sender_id {
-            identities.push(id.as_str());
-        }
+        let identities = Self::authorization_identities(message);
 
-        if self.is_any_user_allowed(identities.iter().copied()) {
+        if self.is_any_user_allowed(identities.iter().map(String::as_str)) {
             return;
         }
 
@@ -2201,14 +2177,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return UpdateDisposition::SkipPermanent;
         }
 
-        let (username, sender_id, sender_identity) = Self::extract_sender_info(message);
+        let (_, _, sender_identity) = Self::extract_sender_info(message);
 
-        let mut identities = vec![username.as_str()];
-        if let Some(id) = sender_id.as_deref() {
-            identities.push(id);
-        }
+        let identities = Self::authorization_identities(message);
 
-        if !self.is_any_user_allowed(identities.iter().copied()) {
+        if !self.is_any_user_allowed(identities.iter().map(String::as_str)) {
             return UpdateDisposition::SkipPermanent;
         }
 
@@ -2436,14 +2409,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return UpdateDisposition::SkipPermanent;
         }
 
-        let (username, sender_id, sender_identity) = Self::extract_sender_info(message);
+        let (_, _, sender_identity) = Self::extract_sender_info(message);
 
-        let mut identities = vec![username.as_str()];
-        if let Some(id) = sender_id.as_deref() {
-            identities.push(id);
-        }
+        let identities = Self::authorization_identities(message);
 
-        if !self.is_any_user_allowed(identities.iter().copied()) {
+        if !self.is_any_user_allowed(identities.iter().map(String::as_str)) {
             return UpdateDisposition::SkipPermanent;
         }
 
@@ -2591,6 +2561,32 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
             ..Default::default()
         }))
+    }
+
+    /// The identifiers this sender can be authorized by.
+    ///
+    /// Deliberately not `extract_sender_info`'s `username`, which substitutes
+    /// the display placeholder `"unknown"` when Telegram sends no username at
+    /// all. That string is a label, not an identifier, and passing it to the
+    /// allowlist let a sender with no usable identity ride a wildcard grant. A
+    /// sender genuinely named `unknown` still authorizes, because presence is
+    /// read from the JSON field rather than from the placeholder's spelling.
+    fn authorization_identities(message: &serde_json::Value) -> Vec<String> {
+        let from = message.get("from");
+        let mut out = Vec::new();
+        if let Some(username) = from
+            .and_then(|from| from.get("username"))
+            .and_then(serde_json::Value::as_str)
+        {
+            out.push(username.to_string());
+        }
+        if let Some(id) = from
+            .and_then(|from| from.get("id"))
+            .and_then(serde_json::Value::as_i64)
+        {
+            out.push(id.to_string());
+        }
+        out
     }
 
     /// Extract sender username and display identity from a Telegram message object.
@@ -2765,14 +2761,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
         let text = message.get("text").and_then(serde_json::Value::as_str)?;
 
-        let (username, sender_id, sender_identity) = Self::extract_sender_info(message);
+        let (_, _, sender_identity) = Self::extract_sender_info(message);
 
-        let mut identities = vec![username.as_str()];
-        if let Some(id) = sender_id.as_deref() {
-            identities.push(id);
-        }
+        let identities = Self::authorization_identities(message);
 
-        if !self.is_any_user_allowed(identities.iter().copied()) {
+        if !self.is_any_user_allowed(identities.iter().map(String::as_str)) {
             return None;
         }
 
@@ -5908,6 +5901,58 @@ mod tests {
         assert_eq!(msg.reply_target, "-100200300");
         assert_eq!(msg.content, "hello");
         assert_eq!(msg.id, "telegram_-100200300_33");
+    }
+
+    /// Telegram substitutes the display placeholder `"unknown"` when a sender
+    /// has no username. That is a label, not an identifier, and passing it to
+    /// the allowlist let a sender with no usable identity ride a wildcard.
+    #[test]
+    fn wildcard_does_not_admit_a_sender_with_no_usable_identity() {
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        // No `username`, no `id`: nothing the operator could ever have listed.
+        let update = serde_json::json!({
+            "update_id": 1,
+            "message": {
+                "message_id": 33,
+                "text": "hello",
+                "from": {},
+                "chat": { "id": -100_200_300 }
+            }
+        });
+        assert!(
+            ch.parse_update_message(&update).is_none(),
+            "a sender with no identifier must not be dispatched under a wildcard"
+        );
+
+        // A sender genuinely named `unknown` is a real account and still passes,
+        // because presence is read from the JSON field, not the placeholder.
+        let named_unknown = serde_json::json!({
+            "update_id": 2,
+            "message": {
+                "message_id": 34,
+                "text": "hello",
+                "from": { "id": 555, "username": "unknown" },
+                "chat": { "id": -100_200_300 }
+            }
+        });
+        assert!(ch.parse_update_message(&named_unknown).is_some());
+
+        // And an id alone is still a usable identifier.
+        let id_only = serde_json::json!({
+            "update_id": 3,
+            "message": {
+                "message_id": 35,
+                "text": "hello",
+                "from": { "id": 555 },
+                "chat": { "id": -100_200_300 }
+            }
+        });
+        assert!(ch.parse_update_message(&id_only).is_some());
     }
 
     #[test]

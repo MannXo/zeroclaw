@@ -18,6 +18,7 @@
 //! persistence with a warning: pairing still works for the process
 //! lifetime, it just isn't durable.
 
+#[cfg(any(feature = "channel-wechat", feature = "whatsapp-web"))]
 use std::sync::Arc;
 use zeroclaw_config::schema::Config;
 
@@ -176,6 +177,7 @@ pub(crate) fn merge_external_peer(
 /// callers may invoke this on every connect/reconnect. `persist = None`
 /// (no handle wired) warns and succeeds without persisting. `match_fn` is the
 /// channel's own admission comparison; see [`merge_external_peer`].
+#[cfg(any(feature = "channel-wechat", feature = "whatsapp-web"))]
 pub(crate) async fn persist_external_peer(
     persist: Option<&Arc<parking_lot::RwLock<Config>>>,
     channel_type: &str,
@@ -643,6 +645,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "channel-wechat", feature = "whatsapp-web"))]
     #[tokio::test]
     async fn persist_without_handle_warns_and_returns_ok() {
         persist_external_peer(None, "whatsapp", "admin", "+15551234567", exact)

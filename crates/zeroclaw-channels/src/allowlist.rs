@@ -162,8 +162,13 @@ pub fn is_identity_allowed_by(
     match_fn: impl Fn(&str, &str) -> bool,
 ) -> bool {
     // An account the channel could not identify is not authorized, wildcard or
-    // not: there is nothing for a deny rule to name.
-    if identities.is_empty() {
+    // not: there is nothing for a deny rule to name. Blank identifiers are the
+    // same case wearing a string: adapters substitute `""` for a missing field
+    // (Twitter for an absent `author_id`, and again for the username it falls
+    // back to), so a slice that is non-empty but carries nothing usable would
+    // otherwise reach the wildcard branch and be admitted with no identifiable
+    // sender at all.
+    if identities.iter().all(|user| user.trim().is_empty()) {
         return false;
     }
     if is_identity_denied_by(allowed, identities, &match_fn) {
@@ -398,6 +403,27 @@ mod tests {
             eq
         ));
         assert!(!is_identity_allowed_by(&list, &["bob.example"], eq));
+    }
+
+    #[test]
+    fn identity_with_only_blank_identifiers_is_denied_under_a_wildcard() {
+        // An adapter with a missing field substitutes `""`, so the slice is
+        // non-empty while naming nobody. Reaching the wildcard branch there
+        // authorizes a sender with no identifiable account at all.
+        let eq = |e: &str, u: &str| e == u;
+        let wildcard = vec!["*".to_string()];
+        for blank in [vec![""], vec![" "], vec!["", ""], vec!["", "  ", "\t"]] {
+            assert!(
+                !is_identity_allowed_by(&wildcard, &blank, eq),
+                "a set of blank identifiers must not ride a wildcard: {blank:?}"
+            );
+        }
+        // A usable identifier alongside a blank one still authorizes: channels
+        // legitimately carry a fallback that is sometimes absent.
+        assert!(is_identity_allowed_by(&wildcard, &["", "alice"], eq));
+        // And the surviving identifier is still the one denies are matched on.
+        let denied = vec!["*".to_string(), "!alice".to_string()];
+        assert!(!is_identity_allowed_by(&denied, &["", "alice"], eq));
     }
 
     #[test]

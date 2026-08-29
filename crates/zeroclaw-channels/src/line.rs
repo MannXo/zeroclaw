@@ -233,9 +233,6 @@ fn is_line_user_allowed(state: &LineState, user_id: &str) -> bool {
 /// No-op-with-warn when `state.persist` is unset (test fixtures).
 async fn persist_line_paired_identity(state: &LineState, user_id: &str) -> anyhow::Result<()> {
     use anyhow::Context;
-    use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
-    use zeroclaw_config::providers::ChannelRef;
-
     let Some(config) = &state.persist else {
         ::zeroclaw_log::record!(
             WARN,
@@ -250,37 +247,20 @@ async fn persist_line_paired_identity(state: &LineState, user_id: &str) -> anyho
     if normalized.is_empty() {
         anyhow::bail!("Cannot persist empty LINE userId");
     }
-    let group_name = format!("line_{}", state.alias);
-    let channel_ref = ChannelRef::new(format!("line.{}", state.alias));
+    // Through the shared writer, which selects its target group by the
+    // `channel` field the runtime reader authorizes by rather than by the
+    // `peer_groups` map key.
     let snapshot = {
         let mut cfg = config.write();
-        if !cfg.channels.line.contains_key(&state.alias) {
-            anyhow::bail!("Missing [channels.line.{}] section", state.alias);
-        }
-        if let Some(conflict) = crate::allowlist::pairing_deny_conflict(
-            &cfg.channel_external_peers("line", &state.alias),
+        if !crate::identity_persist::merge_external_peer(
+            &mut cfg,
             "line",
             &state.alias,
             &normalized,
             |entry, user| entry == user,
-        ) {
-            anyhow::bail!(conflict);
-        }
-        let group = cfg
-            .peer_groups
-            .entry(group_name)
-            .or_insert_with(|| PeerGroupConfig {
-                channel: channel_ref,
-                ..PeerGroupConfig::default()
-            });
-        if group
-            .external_peers
-            .iter()
-            .any(|p| p.as_str() == normalized)
-        {
+        )? {
             return Ok(());
         }
-        group.external_peers.push(PeerUsername::new(normalized));
         cfg.clone()
     };
     snapshot

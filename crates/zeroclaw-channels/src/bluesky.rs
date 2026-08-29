@@ -686,6 +686,19 @@ mod tests {
         ch
     }
 
+    /// Handle and DID are deserialized as unchecked strings, so malformed
+    /// upstream data can leave both blank. That named nobody, yet reached the
+    /// wildcard branch and was admitted.
+    #[test]
+    fn bluesky_wildcard_does_not_admit_a_blank_identity() {
+        let ch = make_channel_with_peers(vec!["*".to_string()]);
+        assert!(!ch.is_author_allowed("", ""));
+        assert!(!ch.is_author_allowed("  ", ""));
+        // Either identifier alone is still enough.
+        assert!(ch.is_author_allowed("alice.bsky.social", ""));
+        assert!(ch.is_author_allowed("", "did:plc:alice"));
+    }
+
     fn make_notification(
         reason: &str,
         handle: &str,
