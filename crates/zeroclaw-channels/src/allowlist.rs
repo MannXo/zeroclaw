@@ -75,10 +75,13 @@ pub fn pairing_deny_conflict(
     allowed: &[String],
     channel_type: &str,
     alias: &str,
-    identity: &str,
+    identities: &[&str],
     match_fn: impl Fn(&str, &str) -> bool,
 ) -> Option<String> {
-    is_user_denied(allowed, identity, &match_fn).then(|| {
+    // Every identifier the account is known by, because admission judges them
+    // together. Asking about one of them lets a deny written against another
+    // spelling pass the pairing gate and then reject every later message.
+    is_identity_denied_by(allowed, identities, &match_fn).then(|| {
         format!(
             "paired {channel_type}.{alias} identity is denied by an `ignore` entry in a \
              matching [peer_groups.*] block — remove that entry from config.toml, then \
@@ -325,8 +328,10 @@ mod tests {
     fn pairing_deny_conflict_reports_the_config_location_not_the_identity() {
         let denied = vec!["*".to_string(), "!+15551234567".to_string()];
         let conflict =
-            pairing_deny_conflict(&denied, "whatsapp", "admin", "+15551234567", |a, b| a == b)
-                .expect("an ignored identity must be reported as a conflict");
+            pairing_deny_conflict(&denied, "whatsapp", "admin", &["+15551234567"], |a, b| {
+                a == b
+            })
+            .expect("an ignored identity must be reported as a conflict");
         assert!(conflict.contains("whatsapp.admin"));
         assert!(conflict.contains("ignore"));
         assert!(
@@ -336,11 +341,12 @@ mod tests {
 
         // Nothing to report when the write would actually take effect.
         assert!(
-            pairing_deny_conflict(&denied, "whatsapp", "admin", "+15559999999", |a, b| a == b)
-                .is_none()
+            pairing_deny_conflict(&denied, "whatsapp", "admin", &["+15559999999"], |a, b| a
+                == b)
+            .is_none()
         );
         assert!(
-            pairing_deny_conflict(&[], "whatsapp", "admin", "+15551234567", |a, b| a == b)
+            pairing_deny_conflict(&[], "whatsapp", "admin", &["+15551234567"], |a, b| a == b)
                 .is_none()
         );
     }

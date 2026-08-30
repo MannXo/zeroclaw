@@ -489,13 +489,13 @@ pub async fn handle_api_channel_bind(
         ));
     }
 
-    let newly = match zeroclaw_channels::orchestrator::bind_channel_identity_into(
+    let target = match zeroclaw_channels::orchestrator::bind_channel_identity_into(
         &mut working,
         channel_type,
         alias,
         &body.identity,
     ) {
-        Ok(added) => added,
+        Ok(target) => target,
         Err(e) => {
             return error_response(ConfigApiError::new(
                 ConfigApiCode::ValidationFailed,
@@ -504,18 +504,25 @@ pub async fn handle_api_channel_bind(
         }
     };
 
-    let group = format!("{channel_type}_{alias}");
     let channel = format!("{channel_type}.{alias}");
 
-    if !newly {
+    // The writer picks its target by the group's `channel` field, so the
+    // destination may be any key, not the conventional `<type>_<alias>`.
+    // Reporting the conventional name would name a group that need not exist.
+    let Some(group) = target else {
         return Json(serde_json::json!({
             "saved": false,
             "already_bound": true,
-            "group": group,
+            "group": zeroclaw_channels::orchestrator::channel_peer_group_key(
+                &working,
+                channel_type,
+                alias,
+            )
+            .unwrap_or_else(|| format!("{channel_type}_{alias}")),
             "channel": channel,
         }))
         .into_response();
-    }
+    };
 
     // Persist with a full `save` (the same path the CLI bind uses), NOT the
     // incremental `save_dirty` behind `persist_and_swap`: a direct peer-group
@@ -4419,6 +4426,76 @@ mod tests {
                 .channel_external_peers("telegram", "alerts")
                 .contains(&"123456789".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn channel_bind_reports_the_custom_group_it_actually_wrote() {
+        use zeroclaw_config::multi_agent::PeerGroupConfig;
+        use zeroclaw_config::providers::ChannelRef;
+
+        // The writer selects its target by the group's `channel` field, so a
+        // custom key is a legitimate destination. Reporting the conventional
+        // `telegram_alerts` would name a group that does not exist, and an
+        // operator following the response would edit the wrong block.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = config_with_telegram_alias(&tmp, "alerts");
+        config.peer_groups.insert(
+            "ops".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("telegram.alerts".to_string()),
+                ..PeerGroupConfig::default()
+            },
+        );
+        let state = test_state(config);
+
+        let bind = |state: AppState| async move {
+            response_json(
+                handle_api_channel_bind(
+                    axum::extract::State(state),
+                    axum::http::HeaderMap::new(),
+                    axum::Json(ChannelBindBody {
+                        channel_type: "telegram".to_string(),
+                        alias: "alerts".to_string(),
+                        identity: "123456789".to_string(),
+                    }),
+                )
+                .await,
+            )
+            .await
+        };
+
+        let (status, json) = bind(state.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["saved"], true);
+        assert_eq!(
+            json["group"], "ops",
+            "the response names the group the identity was written into"
+        );
+        assert!(
+            state
+                .config
+                .read()
+                .peer_groups
+                .get("ops")
+                .expect("the custom group is the destination")
+                .external_peers
+                .iter()
+                .any(|peer| peer.as_str() == "123456789")
+        );
+        assert!(
+            !state
+                .config
+                .read()
+                .peer_groups
+                .contains_key("telegram_alerts"),
+            "the conventional group was never created, which is why naming it would mislead"
+        );
+
+        // The idempotent answer has to name the same real group.
+        let (status, json) = bind(state.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["already_bound"], true);
+        assert_eq!(json["group"], "ops");
     }
 
     #[tokio::test]

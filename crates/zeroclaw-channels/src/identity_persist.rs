@@ -36,21 +36,55 @@ pub(crate) fn external_peer_deny_conflict(
     cfg: &Config,
     channel_type: &str,
     alias: &str,
-    identity: &str,
+    identities: &[&str],
     match_fn: impl Fn(&str, &str) -> bool,
 ) -> Option<String> {
-    let normalized = identity.trim();
-    if normalized.is_empty() {
+    let usable: Vec<&str> = identities
+        .iter()
+        .map(|identity| identity.trim())
+        .filter(|identity| !identity.is_empty())
+        .collect();
+    if usable.is_empty() {
         return None;
     }
     let resolved = cfg.channel_external_peers(channel_type, alias);
-    crate::allowlist::pairing_deny_conflict(&resolved, channel_type, alias, normalized, match_fn)
+    crate::allowlist::pairing_deny_conflict(&resolved, channel_type, alias, &usable, match_fn)
+}
+
+/// The `peer_groups` key whose `channel` is exactly `<channel_type>.<alias>`,
+/// which is where a write for that instance lands.
+///
+/// Prefers the conventional `<channel_type>_<alias>` key when several groups
+/// carry the same dotted ref, then falls back to the lexicographically first
+/// for determinism (`peer_groups` is a `HashMap`, so iteration order is
+/// unspecified). Callers reporting where an identity is bound use this rather
+/// than assuming the conventional name: a custom key such as
+/// `[peer_groups.ops]` with `channel = "telegram.alerts"` is a legitimate
+/// destination, and the conventional name may name nothing at all.
+#[must_use]
+pub fn instance_group_key(cfg: &Config, channel_type: &str, alias: &str) -> Option<String> {
+    let dotted_ref = format!("{channel_type}.{alias}");
+    let conventional_key = format!("{channel_type}_{alias}");
+    if cfg
+        .peer_groups
+        .get(&conventional_key)
+        .is_some_and(|group| group.channel.as_str() == dotted_ref)
+    {
+        return Some(conventional_key);
+    }
+    cfg.peer_groups
+        .iter()
+        .filter(|(_, group)| group.channel.as_str() == dotted_ref)
+        .map(|(key, _)| key.clone())
+        .min()
 }
 
 /// Merge `identity` into the `external_peers` of the peer group whose
 /// `channel` ref matches `<channel_type>.<alias>`, on the canonical
-/// in-memory config. Returns `true` when the config changed (the caller
-/// persists a snapshot), `false` when the identity was already authorized.
+/// in-memory config. Returns the `peer_groups` key that was written when the
+/// config changed (the caller persists a snapshot, and callers that report the
+/// destination must report *this* key rather than assuming the conventional
+/// one), or `None` when the identity was already authorized.
 ///
 /// `match_fn` is the calling channel's own identity comparison, the one its
 /// admission path applies. Both decisions this writer makes — whether a deny
@@ -92,7 +126,7 @@ pub(crate) fn merge_external_peer(
     alias: &str,
     identity: &str,
     match_fn: impl Fn(&str, &str) -> bool,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<String>> {
     use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
     use zeroclaw_config::providers::ChannelRef;
 
@@ -119,7 +153,7 @@ pub(crate) fn merge_external_peer(
     let resolved = cfg.channel_external_peers(channel_type, alias);
 
     if let Some(conflict) =
-        external_peer_deny_conflict(cfg, channel_type, alias, normalized, &match_fn)
+        external_peer_deny_conflict(cfg, channel_type, alias, &[normalized], &match_fn)
     {
         anyhow::bail!(conflict);
     }
@@ -132,29 +166,13 @@ pub(crate) fn merge_external_peer(
     // identity matches may sit alongside an `ignore` that denies it, and
     // pairing must not report an ignored identity as authorized.
     if crate::allowlist::is_user_allowed_by(&resolved, normalized, &match_fn) {
-        return Ok(false);
+        return Ok(None);
     }
 
     let dotted_ref = format!("{channel_type}.{alias}");
     let conventional_key = format!("{channel_type}_{alias}");
 
-    // Append to the instance-scoped group the reader will match. Prefer
-    // the conventional key when several groups carry the same dotted ref,
-    // then fall back to the lexicographically first for determinism
-    // (peer_groups is a HashMap; iteration order is unspecified).
-    let target_key = if cfg
-        .peer_groups
-        .get(&conventional_key)
-        .is_some_and(|group| group.channel.as_str() == dotted_ref)
-    {
-        Some(conventional_key.clone())
-    } else {
-        cfg.peer_groups
-            .iter()
-            .filter(|(_, group)| group.channel.as_str() == dotted_ref)
-            .map(|(key, _)| key.clone())
-            .min()
-    };
+    let target_key = instance_group_key(cfg, channel_type, alias);
 
     if let Some(key) = target_key {
         // Invariant: `target_key` was selected from existing map entries.
@@ -163,7 +181,7 @@ pub(crate) fn merge_external_peer(
                 .external_peers
                 .push(PeerUsername::new(normalized.to_string()));
         }
-        return Ok(true);
+        return Ok(Some(key));
     }
 
     // No group carries this channel's dotted ref yet — create the
@@ -180,14 +198,14 @@ pub(crate) fn merge_external_peer(
         );
     }
     cfg.peer_groups.insert(
-        conventional_key,
+        conventional_key.clone(),
         PeerGroupConfig {
             channel: ChannelRef::new(dotted_ref),
             external_peers: vec![PeerUsername::new(normalized.to_string())],
             ..PeerGroupConfig::default()
         },
     );
-    Ok(true)
+    Ok(Some(conventional_key))
 }
 
 /// Persist a paired identity as an authorized external peer.
@@ -226,7 +244,7 @@ pub(crate) async fn persist_external_peer(
     };
     let snapshot = {
         let mut cfg = config.write();
-        if !merge_external_peer(&mut cfg, channel_type, alias, identity, match_fn)? {
+        if merge_external_peer(&mut cfg, channel_type, alias, identity, match_fn)?.is_none() {
             return Ok(());
         }
         cfg.clone()
@@ -266,7 +284,7 @@ mod tests {
 
         let changed = merge_external_peer(&mut config, "whatsapp", "admin", "+15551234567", exact)
             .expect("merge succeeds");
-        assert!(changed);
+        assert!(changed.is_some());
 
         let group = config
             .peer_groups
@@ -288,14 +306,20 @@ mod tests {
         let mut config = config_with_whatsapp("admin");
 
         assert!(
-            merge_external_peer(&mut config, "whatsapp", "admin", "+15551234567", exact).unwrap()
+            merge_external_peer(&mut config, "whatsapp", "admin", "+15551234567", exact)
+                .unwrap()
+                .is_some()
         );
         assert!(
-            !merge_external_peer(&mut config, "whatsapp", "admin", "+15551234567", exact).unwrap(),
+            merge_external_peer(&mut config, "whatsapp", "admin", "+15551234567", exact)
+                .unwrap()
+                .is_none(),
             "an already-authorized identity is not re-added"
         );
         assert!(
-            merge_external_peer(&mut config, "whatsapp", "admin", "+15559876543", exact).unwrap(),
+            merge_external_peer(&mut config, "whatsapp", "admin", "+15559876543", exact)
+                .unwrap()
+                .is_some(),
             "a second identity extends the same group"
         );
         assert_eq!(
@@ -326,7 +350,9 @@ mod tests {
         );
 
         assert!(
-            merge_external_peer(&mut config, "whatsapp", "admin", "+15551234567", exact).unwrap()
+            merge_external_peer(&mut config, "whatsapp", "admin", "+15551234567", exact)
+                .unwrap()
+                .is_some()
         );
         let group = config.peer_groups.get("whatsapp_admin").unwrap();
         assert_eq!(group.agents.len(), 1, "agent bindings survive the merge");
@@ -365,7 +391,11 @@ mod tests {
             },
         );
 
-        assert!(merge_external_peer(&mut config, "telegram", "admin", "someone", exact).unwrap());
+        assert!(
+            merge_external_peer(&mut config, "telegram", "admin", "someone", exact)
+                .unwrap()
+                .is_some()
+        );
         let group = config
             .peer_groups
             .get("telegram_admin")
@@ -428,8 +458,9 @@ mod tests {
             .ignore
             .clear();
         assert!(
-            !merge_external_peer(&mut config, "whatsapp", "admin", "+15551234567", exact)
-                .expect("merge succeeds once the deny is gone"),
+            merge_external_peer(&mut config, "whatsapp", "admin", "+15551234567", exact)
+                .expect("merge succeeds once the deny is gone")
+                .is_none(),
             "the existing grant is now effective, so nothing needs writing"
         );
         assert!(crate::allowlist::is_user_allowed_by(
@@ -490,7 +521,9 @@ mod tests {
         );
 
         assert!(
-            merge_external_peer(&mut config, "whatsapp", "admin", "+15551234567", exact).unwrap()
+            merge_external_peer(&mut config, "whatsapp", "admin", "+15551234567", exact)
+                .unwrap()
+                .is_some()
         );
         assert!(
             !config.peer_groups.contains_key("whatsapp_admin"),
@@ -538,7 +571,9 @@ mod tests {
         );
 
         assert!(
-            merge_external_peer(&mut config, "whatsapp", "admin", "+15551234567", exact).unwrap()
+            merge_external_peer(&mut config, "whatsapp", "admin", "+15551234567", exact)
+                .unwrap()
+                .is_some()
         );
         assert_eq!(
             config
@@ -585,7 +620,9 @@ mod tests {
         }
 
         assert!(
-            merge_external_peer(&mut config, "whatsapp", "admin", "+15551234567", exact).unwrap()
+            merge_external_peer(&mut config, "whatsapp", "admin", "+15551234567", exact)
+                .unwrap()
+                .is_some()
         );
         assert_eq!(
             config
@@ -627,7 +664,9 @@ mod tests {
         );
 
         assert!(
-            !merge_external_peer(&mut config, "whatsapp", "admin", "+15551234567", exact).unwrap(),
+            merge_external_peer(&mut config, "whatsapp", "admin", "+15551234567", exact)
+                .unwrap()
+                .is_none(),
             "already authorized via the type-wide group"
         );
         assert_eq!(config.peer_groups.len(), 1, "no new group created");

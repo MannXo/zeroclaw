@@ -19616,49 +19616,77 @@ struct ExtraNestedModelProviderTable {
 /// granted, so the reservation fails closed.
 pub const PEER_DENY_PREFIX: char = '!';
 
+/// How many `PEER_DENY_PREFIX` characters open `value`.
+fn leading_deny_prefixes(value: &str) -> usize {
+    value
+        .bytes()
+        .take_while(|byte| *byte == PEER_DENY_PREFIX as u8)
+        .count()
+}
+
 /// The grant identity `entry` names, or `None` when `entry` is a deny marker.
 ///
-/// A grant whose own text begins with `PEER_DENY_PREFIX` travels doubled, so
-/// the encoding stays unambiguous: RFC 5322 permits `!` to open an email
-/// local-part, and `!user@example.com` is a legitimate address an operator may
-/// grant. Without the escape the resolver would emit it as a deny of
-/// `user@example.com` — inverting the operator's intent on a surface whose
-/// whole job is authorization. Pairs with `peer_deny_marker`.
+/// Grants and denies share one string channel, so the encoding has to stay
+/// injective even when the identity itself opens with the marker character.
+/// RFC 5322 permits `!` to open an email local-part, and the email and Gmail
+/// matchers take full addresses through this helper, so `!user@example.com` is
+/// an address an operator may legitimately grant *or* ignore. The two cases
+/// must not collide: an encoding that maps a grant of `!x` and a deny of `!x`
+/// onto the same string silently inverts one of them, which on an authorization
+/// surface is the whole failure mode.
+///
+/// So the *count* of leading markers carries the decision, not merely its
+/// presence. An identity opening with `k` markers is emitted with `2k` for a
+/// grant and `2k + 1` for a deny: an even run is a grant, an odd run is a deny,
+/// and halving the run recovers the identity in both cases. An identity that
+/// does not open with the marker keeps the original encoding, so every existing
+/// config and every entry in a persisted `config.toml` reads exactly as before.
+///
+/// | identity | as a grant | as a deny |
+/// | --- | --- | --- |
+/// | `alice` | `alice` | `!alice` |
+/// | `!alice` | `!!alice` | `!!!alice` |
+///
+/// Pairs with `peer_grant_marker` and `peer_deny_marker`.
 #[must_use]
 pub fn peer_grant_identity(entry: &str) -> Option<&str> {
-    match entry.strip_prefix(PEER_DENY_PREFIX) {
-        // `!!name` is the escaped grant for the literal `!name`.
-        Some(rest) => rest.strip_prefix(PEER_DENY_PREFIX).map(|_| &entry[1..]),
-        None => Some(entry),
+    let markers = leading_deny_prefixes(entry);
+    // An odd run is a deny; only an even one names a grant.
+    if !markers.is_multiple_of(2) {
+        return None;
     }
+    // Dropping half the run leaves the identity's own markers in place.
+    // `PEER_DENY_PREFIX` is ASCII, so the byte index is a char boundary.
+    Some(&entry[markers / 2..])
 }
 
 /// The identity `entry` denies, or `None` when `entry` is a grant.
+///
+/// The odd-run half of the contract described on `peer_grant_identity`.
 #[must_use]
 pub fn peer_deny_identity(entry: &str) -> Option<&str> {
-    let rest = entry.strip_prefix(PEER_DENY_PREFIX)?;
-    // A doubled prefix is an escaped grant, not a deny.
-    if rest.starts_with(PEER_DENY_PREFIX) {
+    let markers = leading_deny_prefixes(entry);
+    if markers.is_multiple_of(2) {
         return None;
     }
-    Some(rest)
+    Some(&entry[markers.div_ceil(2)..])
 }
 
-/// Encode `identity` as a grant entry, doubling a leading
-/// `PEER_DENY_PREFIX` so it cannot be read as a deny marker.
+/// Encode `identity` as a grant entry: an even run of markers.
 #[must_use]
 pub fn peer_grant_marker(identity: &str) -> String {
-    if identity.starts_with(PEER_DENY_PREFIX) {
-        format!("{PEER_DENY_PREFIX}{identity}")
-    } else {
-        identity.to_string()
-    }
+    let markers = leading_deny_prefixes(identity);
+    format!("{}{identity}", PEER_DENY_PREFIX.to_string().repeat(markers))
 }
 
-/// Encode `identity` as a deny marker.
+/// Encode `identity` as a deny marker: an odd run of markers.
 #[must_use]
 pub fn peer_deny_marker(identity: &str) -> String {
-    format!("{PEER_DENY_PREFIX}{identity}")
+    let markers = leading_deny_prefixes(identity);
+    format!(
+        "{}{identity}",
+        PEER_DENY_PREFIX.to_string().repeat(markers + 1)
+    )
 }
 
 /// Classification of a `peer_groups.<name>.channel` reference against the
@@ -25026,6 +25054,83 @@ mod tests {
         assert_eq!(
             config.channel_external_peers("reddit", "ops"),
             vec!["u/alice".to_string(), "!alice".to_string()]
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn grant_and_deny_encodings_never_collide() {
+        // The property the encoding exists for: no identity, however many
+        // markers it opens with, can be encoded as a grant and as a deny onto
+        // the same string. A collision here silently inverts an operator's
+        // rule, which is the failure this whole surface is meant to prevent.
+        let identities = [
+            "alice",
+            "*",
+            "user@example.com",
+            "!user@example.com",
+            "!!user@example.com",
+            "!!!weird",
+            "!",
+            "!!",
+        ];
+        for identity in identities {
+            let grant = super::peer_grant_marker(identity);
+            let deny = super::peer_deny_marker(identity);
+            assert_ne!(grant, deny, "encodings collide for {identity:?}");
+
+            assert_eq!(
+                super::peer_grant_identity(&grant),
+                Some(identity),
+                "grant of {identity:?} must decode to itself"
+            );
+            assert_eq!(
+                super::peer_deny_identity(&grant),
+                None,
+                "grant of {identity:?} must not read as a deny"
+            );
+
+            assert_eq!(
+                super::peer_deny_identity(&deny),
+                Some(identity),
+                "deny of {identity:?} must decode to itself"
+            );
+            assert_eq!(
+                super::peer_grant_identity(&deny),
+                None,
+                "deny of {identity:?} must not read as a grant"
+            );
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn an_ignore_that_opens_with_the_deny_prefix_still_denies_under_a_wildcard() {
+        // The regression: the previous escape mapped `ignore = ["!user@..."]`
+        // onto the same string as a grant of `!user@...`, so the deny vanished
+        // and the wildcard admitted the sender.
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.email_ops]
+            channel = "email.ops"
+            external_peers = ["*"]
+            ignore = ["!user@example.com"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        let resolved = config.channel_external_peers("email", "ops");
+        assert_eq!(
+            resolved,
+            vec!["*".to_string(), "!!!user@example.com".to_string()]
+        );
+        assert_eq!(
+            super::peer_deny_identity("!!!user@example.com"),
+            Some("!user@example.com"),
+            "the deny survives the round trip"
+        );
+        assert_eq!(super::peer_grant_identity("!!!user@example.com"), None);
+        assert!(
+            config.channel_addressable_peers("email", "ops").is_empty(),
+            "the only named identity is denied, so nothing is addressable"
         );
     }
 

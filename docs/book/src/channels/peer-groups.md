@@ -59,12 +59,21 @@ A wildcard is recognized with surrounding whitespace trimmed, so `[" * "]` and
 `["*"]` mean the same thing to both halves of the rule.
 
 `!` therefore opens a deny marker in the resolved list. An identity may legally
-begin with `!`, since RFC 5322 allows it in an email local-part, so a grant whose
-own text starts with `!` travels doubled. `external_peers = ["!user@example.com"]`
-resolves to `!!user@example.com`, which reads back as a grant for the literal
-`!user@example.com`. A single leading `!` is always a deny, a doubled one always
-a grant, and nothing an operator can write is silently inverted. You write the
-address as it is; the doubling is internal to the resolved list.
+begin with `!`, since RFC 5322 allows it in an email local-part, so the *count*
+of leading markers carries the decision rather than merely its presence. An
+identity opening with `k` markers is emitted with `2k` as a grant and `2k + 1`
+as a deny, so an even run is a grant, an odd run is a deny, and halving the run
+recovers the identity:
+
+| identity | as `external_peers` | as `ignore` |
+| --- | --- | --- |
+| `alice` | `alice` | `!alice` |
+| `!user@example.com` | `!!user@example.com` | `!!!user@example.com` |
+
+An identity that does not begin with `!` encodes exactly as it always did, so no
+existing config reads differently. Nothing an operator can write is silently
+inverted in either direction. You write the address as it is; the doubling is
+internal to the resolved list.
 
 A channel written more than one way in `channel` (WeCom WebSocket answers to
 both `wecom-ws` and `wecom_ws`) resolves as one set. Resolving each spelling on

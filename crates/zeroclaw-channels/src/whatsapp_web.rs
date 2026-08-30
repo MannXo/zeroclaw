@@ -4083,14 +4083,15 @@ mod tests {
             .ignore
             .clear();
         assert!(
-            !crate::identity_persist::merge_external_peer(
+            crate::identity_persist::merge_external_peer(
                 &mut config,
                 "whatsapp",
                 "admin",
                 "+15551234567",
                 WhatsAppWebChannel::phone_matches,
             )
-            .expect("merge succeeds once the deny is gone"),
+            .expect("merge succeeds once the deny is gone")
+            .is_none(),
             "the existing grant is now effective, so nothing needs writing"
         );
         let resolved = config.channel_external_peers("whatsapp", "admin");

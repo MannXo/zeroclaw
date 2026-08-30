@@ -70,6 +70,33 @@ impl PairingGuard {
         }
     }
 
+    /// Undo a `try_pair` that the caller could not complete: drop the minted
+    /// token and put the one-time code back.
+    ///
+    /// Pairing is two steps that must stand or fall together. `try_pair`
+    /// consumes the code and mints a bearer token, and only afterwards can the
+    /// caller discover that the identity cannot be persisted: a peer group
+    /// whose `channel` names another instance, a `Config::save()` that fails on
+    /// permissions, or a deny that arrived on a config reload since the
+    /// precheck. Without this, that sender holds a runtime-only token the
+    /// admission matcher rejects, `pairing_code_active()` is false, and nobody
+    /// can retry until the operator restarts the daemon to issue a new code.
+    ///
+    /// Restoring the code is safe because it is the same secret the operator
+    /// already holds: this hands back the state that existed before the call,
+    /// rather than widening anything. Returns whether the token was found, so a
+    /// caller can tell a real rollback from a double call.
+    pub fn rollback_pair(&self, code: &str, token: &str) -> bool {
+        let removed = self.paired_tokens.lock().remove(&hash_token(token));
+        let mut pairing_code = self.pairing_code.lock();
+        // Only restore into an empty slot. A code reissued in the meantime is
+        // the newer secret and must not be clobbered by this undo.
+        if pairing_code.is_none() {
+            *pairing_code = Some(code.to_string());
+        }
+        removed
+    }
+
     /// The one-time pairing code (generated only on first startup when no tokens exist).
     pub fn pairing_code(&self) -> Option<String> {
         self.pairing_code.lock().clone()
@@ -377,6 +404,52 @@ mod tests {
         assert!(token.is_some());
         assert!(token.unwrap().starts_with("zc_"));
         assert!(guard.is_paired());
+    }
+
+    #[test]
+    async fn rollback_pair_restores_the_code_and_drops_the_token() {
+        let guard = PairingGuard::new(true, &[]);
+        let code = guard.pairing_code().unwrap().to_string();
+        let token = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
+        assert!(guard.is_paired());
+        assert!(guard.pairing_code().is_none(), "try_pair consumes the code");
+
+        assert!(
+            guard.rollback_pair(&code, &token),
+            "the minted token was found and removed"
+        );
+        assert!(
+            !guard.is_paired(),
+            "the runtime-only token must not survive a rolled-back bind"
+        );
+        assert_eq!(
+            guard.pairing_code().as_deref(),
+            Some(code.as_str()),
+            "the operator's one-time code is usable again"
+        );
+
+        // And it still works: the rollback left a genuinely re-pairable guard.
+        let second = guard.try_pair(&code, "test_client").await.unwrap();
+        assert!(second.is_some(), "the restored code pairs again");
+    }
+
+    #[test]
+    async fn rollback_pair_does_not_clobber_a_reissued_code() {
+        let guard = PairingGuard::new(true, &[]);
+        let code = guard.pairing_code().unwrap().to_string();
+        let token = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
+
+        let reissued = guard
+            .generate_new_pairing_code()
+            .expect("operator issued a fresh code");
+        assert_ne!(reissued, code);
+
+        guard.rollback_pair(&code, &token);
+        assert_eq!(
+            guard.pairing_code().as_deref(),
+            Some(reissued.as_str()),
+            "the newer secret wins; an undo must not resurrect the stale one"
+        );
     }
 
     #[test]
