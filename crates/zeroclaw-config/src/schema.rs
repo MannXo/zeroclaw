@@ -20063,6 +20063,10 @@ impl Config {
             .iter()
             .filter_map(|peer| peer_grant_identity(peer))
             .filter(|peer| peer.trim() != "*")
+            // A blank grant is not an address. `external_peers = [""]` parses,
+            // and heartbeat auto-detection takes the first entry it is handed,
+            // so leaving it in makes an empty string a proactive recipient.
+            .filter(|peer| !peer.trim().is_empty())
             .filter(|peer| !denied.contains(&peer.trim().trim_start_matches('@').to_lowercase()))
             .map(str::to_string)
             .collect()
@@ -25566,6 +25570,44 @@ mod tests {
             config
                 .channel_addressable_peers("telegram", "ops")
                 .is_empty()
+        );
+    }
+
+    /// A blank grant is not a delivery address.
+    ///
+    /// `auto_detect_heartbeat_channel` takes the first entry this returns, so
+    /// leaving `""` in the set makes an empty string a proactive recipient.
+    #[::core::prelude::v1::test]
+    fn a_blank_grant_is_not_addressable() {
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.telegram_grant]
+            channel = "telegram"
+            external_peers = ["", "   "]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        assert!(
+            config
+                .channel_addressable_peers("telegram", "ops")
+                .is_empty(),
+            "a blank grant gives heartbeat auto-detection nothing to pick"
+        );
+
+        // Control: a real grant beside the blank ones is still addressable, so
+        // this cannot pass by emptying the set for every policy.
+        let mixed: super::Config = toml::from_str(
+            r#"
+            [peer_groups.telegram_grant]
+            channel = "telegram"
+            external_peers = ["", "user456"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+        assert_eq!(
+            mixed.channel_addressable_peers("telegram", "ops"),
+            vec!["user456".to_string()]
         );
     }
 

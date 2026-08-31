@@ -8721,6 +8721,28 @@ pub fn channel_peer_group_key(config: &Config, channel_type: &str, alias: &str) 
     crate::identity_persist::instance_group_key(config, channel_type, alias)
 }
 
+/// The `peer_groups` key that already authorizes `identity`, for reporting an
+/// `already_bound` result without guessing a name. See
+/// [`crate::identity_persist::authorizing_group_key`].
+#[must_use]
+pub fn channel_authorizing_group_key(
+    config: &Config,
+    channel_type: &str,
+    alias: &str,
+    identity: &str,
+) -> Option<String> {
+    crate::identity_persist::authorizing_group_key(
+        config,
+        channel_type,
+        alias,
+        identity,
+        |entry, user| {
+            entry.trim().trim_start_matches('@').to_lowercase()
+                == user.trim().trim_start_matches('@').to_lowercase()
+        },
+    )
+}
+
 /// Add `identity` to the peer group bound to `<type>.<alias>` in-place.
 ///
 /// Returns `Ok(Some(key))` naming the `peer_groups` key actually written when

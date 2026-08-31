@@ -247,7 +247,6 @@ fn line_pairing_deny_conflict(state: &LineState, user_id: &str) -> Option<String
 }
 
 async fn persist_line_paired_identity(state: &LineState, user_id: &str) -> anyhow::Result<()> {
-    use anyhow::Context;
     let Some(config) = &state.persist else {
         ::zeroclaw_log::record!(
             WARN,
@@ -265,26 +264,14 @@ async fn persist_line_paired_identity(state: &LineState, user_id: &str) -> anyho
     // Through the shared writer, which selects its target group by the
     // `channel` field the runtime reader authorizes by rather than by the
     // `peer_groups` map key.
-    let snapshot = {
-        let mut cfg = config.write();
-        if crate::identity_persist::merge_external_peer(
-            &mut cfg,
-            "line",
-            &state.alias,
-            &normalized,
-            |entry, user| entry == user,
-        )?
-        .is_none()
-        {
-            return Ok(());
-        }
-        cfg.clone()
-    };
-    snapshot
-        .save()
-        .await
-        .context("Failed to persist LINE paired userId to config.toml")?;
-    Ok(())
+    crate::identity_persist::persist_external_peer(
+        Some(config),
+        "line",
+        &state.alias,
+        &normalized,
+        |entry, user| entry == user,
+    )
+    .await
 }
 
 async fn handle_webhook(

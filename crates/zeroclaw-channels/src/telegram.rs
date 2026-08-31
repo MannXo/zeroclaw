@@ -1183,26 +1183,14 @@ impl TelegramChannel {
         // `peer_groups` map key. Selecting by key wrote the grant into whatever
         // group happened to be named `telegram_<alias>`, even one whose
         // `channel` points at a different instance, and reported success.
-        let snapshot = {
-            let mut cfg = config.write();
-            if crate::identity_persist::merge_external_peer(
-                &mut cfg,
-                "telegram",
-                &self.alias,
-                &normalized,
-                |entry, user| Self::normalize_identity(entry) == user,
-            )?
-            .is_none()
-            {
-                return Ok(());
-            }
-            cfg.clone()
-        };
-        snapshot
-            .save()
-            .await
-            .context("Failed to persist Telegram peer to config.toml")?;
-        Ok(())
+        crate::identity_persist::persist_external_peer(
+            Some(config),
+            "telegram",
+            &self.alias,
+            &normalized,
+            |entry, user| Self::normalize_identity(entry) == user,
+        )
+        .await
     }
 
     fn extract_bind_code(text: &str) -> Option<&str> {

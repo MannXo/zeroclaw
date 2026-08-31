@@ -510,15 +510,22 @@ pub async fn handle_api_channel_bind(
     // destination may be any key, not the conventional `<type>_<alias>`.
     // Reporting the conventional name would name a group that need not exist.
     let Some(group) = target else {
+        // Name the group that actually carries the grant, including a bare
+        // type-wide one. Falling back to the conventional `<type>_<alias>` key
+        // named a block that need not exist and sent operators to edit it.
+        let source = zeroclaw_channels::orchestrator::channel_authorizing_group_key(
+            &working,
+            channel_type,
+            alias,
+            &body.identity,
+        )
+        .or_else(|| {
+            zeroclaw_channels::orchestrator::channel_peer_group_key(&working, channel_type, alias)
+        });
         return Json(serde_json::json!({
             "saved": false,
             "already_bound": true,
-            "group": zeroclaw_channels::orchestrator::channel_peer_group_key(
-                &working,
-                channel_type,
-                alias,
-            )
-            .unwrap_or_else(|| format!("{channel_type}_{alias}")),
+            "group": source,
             "channel": channel,
         }))
         .into_response();

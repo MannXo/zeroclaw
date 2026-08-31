@@ -48,6 +48,11 @@ pub fn grants_anyone(allowed: &[String]) -> bool {
     allowed
         .iter()
         .filter_map(|entry| peer_grant_identity(entry))
+        // A blank grant names nobody, so it cannot be the effective grant that
+        // suppresses recovery pairing. `external_peers = [""]` parses, and
+        // treating it as authorization left Telegram, LINE and WeChat refusing
+        // to offer a pairing code while no real sender matched it.
+        .filter(|grant| !grant.trim().is_empty())
         .any(|grant| {
             // A wildcard grant outlives any named deny: every sender the denies
             // do not name still rides it.
@@ -295,6 +300,71 @@ mod tests {
         let partial = vec!["alice".to_string(), "bob".to_string(), "!alice".to_string()];
         assert!(grants_anyone(&partial));
         assert!(is_user_allowed(&partial, "bob", Match::Sensitive));
+    }
+
+    /// A blank grant names nobody, so it must not report an effective grant.
+    ///
+    /// `external_peers = [""]` parses, and Telegram, LINE and WeChat build a
+    /// pairing guard only when `grants_anyone` is false. Counting the blank as
+    /// authorization left every real sender rejected with no recovery code
+    /// on offer, which is the pairing dead end #9428 documents the opposite of.
+    #[test]
+    fn grants_anyone_ignores_blank_and_whitespace_grants() {
+        assert!(!grants_anyone(&[String::new()]));
+        assert!(!grants_anyone(&["   ".to_string()]));
+        assert!(!grants_anyone(&["\t".to_string(), " ".to_string()]));
+        // No real sender matches it either, so the two agree.
+        assert!(!is_user_allowed(
+            &[String::new()],
+            "alice",
+            Match::Sensitive
+        ));
+
+        // Control: a nonblank grant alongside a blank one still counts.
+        let mixed = vec![String::new(), "alice".to_string()];
+        assert!(grants_anyone(&mixed));
+        assert!(is_user_allowed(&mixed, "alice", Match::Sensitive));
+    }
+
+    /// The same question the pairing constructors ask, driven from a real
+    /// config through the real resolver rather than a hand-built vector.
+    ///
+    /// Telegram (`telegram.rs`), LINE (`line.rs`) and WeChat (`wechat.rs`) each
+    /// build their `PairingGuard` only when this is false, so a config that
+    /// makes it true suppresses the recovery code for every one of them.
+    #[test]
+    fn a_blank_configured_grant_still_offers_pairing() {
+        let config: zeroclaw_config::schema::Config = toml::from_str(
+            r#"
+            [peer_groups.telegram_ops]
+            channel = "telegram"
+            external_peers = ["", "  "]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        let resolved = config.channel_external_peers("telegram", "ops");
+        assert!(
+            !resolved.is_empty(),
+            "the blank entries really do survive into the resolved policy"
+        );
+        assert!(
+            !grants_anyone(&resolved),
+            "a blank grant must not suppress the pairing code"
+        );
+
+        // Control: a real grant in the same shape does suppress it.
+        let granted: zeroclaw_config::schema::Config = toml::from_str(
+            r#"
+            [peer_groups.telegram_ops]
+            channel = "telegram"
+            external_peers = ["alice"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+        assert!(grants_anyone(
+            &granted.channel_external_peers("telegram", "ops")
+        ));
     }
 
     #[test]
