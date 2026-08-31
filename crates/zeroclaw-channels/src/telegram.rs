@@ -2047,11 +2047,18 @@ impl TelegramChannel {
                     return;
                 }
 
-                match pairing.try_pair(code, &chat_id).await {
-                    Ok(Some(token)) => {
+                // Reserved, not paired: the code is held aside and the token is
+                // only minted by `commit()`. Dropping the reservation restores
+                // the code, so a persistence failure below cannot spend the
+                // operator's one-time secret on a binding that did not happen.
+                match pairing.reserve_pair(code, &chat_id).await {
+                    Ok(Some(reservation)) => {
                         if let Some(identity) = bind_identity {
                             match Box::pin(self.persist_allowed_identity(&identity)).await {
                                 Ok(()) => {
+                                    // Durable write landed, so the pairing may
+                                    // now consume the code and mint the token.
+                                    let _ = reservation.commit();
                                     let _ = self
                                         .send(&SendMessage::new(
                                             "✅ Telegram account bound successfully. You can talk to ZeroClaw now.",
@@ -2069,12 +2076,12 @@ impl TelegramChannel {
                                     );
                                 }
                                 Err(e) => {
-                                    // The write is the binding. Keeping a
-                                    // runtime-only token here would leave a
-                                    // sender the admission matcher still
-                                    // rejects holding the only spent code, so
-                                    // undo the pairing and hand the code back.
-                                    pairing.rollback_pair(code, &token);
+                                    // The write is the binding. Leaving the
+                                    // reservation uncommitted drops the token
+                                    // and hands the code back, so a sender the
+                                    // admission matcher still rejects never
+                                    // holds the only spent code.
+                                    drop(reservation);
                                     ::zeroclaw_log::record!(
                                         ERROR,
                                         ::zeroclaw_log::Event::new(
@@ -2095,7 +2102,7 @@ impl TelegramChannel {
                             }
                         } else {
                             // Nothing to persist means nothing was bound.
-                            pairing.rollback_pair(code, &token);
+                            drop(reservation);
                             let _ = self
                                 .send(&SendMessage::new(
                                     "❌ Could not identify your Telegram account. Ensure your account has a username or stable user ID, then retry.",

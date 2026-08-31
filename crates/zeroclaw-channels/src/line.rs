@@ -557,16 +557,20 @@ async fn handle_webhook(
                                     }
                                     continue;
                                 }
-                                match guard.try_pair(code, user_id).await {
-                                    Ok(Some(pair_token)) => {
+                                // Reserved, not paired: `commit()` below is what
+                                // consumes the code and mints the token, so a
+                                // failed write leaves the code usable.
+                                match guard.reserve_pair(code, user_id).await {
+                                    Ok(Some(reservation)) => {
                                         if let Err(e) =
                                             persist_line_paired_identity(&*state, user_id).await
                                         {
-                                            // Undo rather than reply with the
-                                            // success message: the write is
-                                            // what admits this sender, and the
-                                            // spent code was their only retry.
-                                            guard.rollback_pair(code, &pair_token);
+                                            // Reply with the failure message
+                                            // rather than the success one: the
+                                            // write is what admits this sender,
+                                            // and the spent code was their only
+                                            // retry.
+                                            drop(reservation);
                                             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"user_id": user_id, "e": e.to_string()})), "rolled back bind: could not persist paired userId=");
                                             if let Some(ref token) = bind_reply_token {
                                                 send_bind_reply(
@@ -583,6 +587,9 @@ async fn handle_webhook(
                                             }
                                             continue;
                                         } else {
+                                            // Durable write landed, so the
+                                            // pairing may consume the code.
+                                            let _ = reservation.commit();
                                             ::zeroclaw_log::record!(
                                                 INFO,
                                                 ::zeroclaw_log::Event::new(

@@ -2158,19 +2158,23 @@ impl WeChatChannel {
                     let _ = self.send_text(from_user_id, &reply, ctx.as_deref()).await;
                     return;
                 }
-                match pairing.try_pair(code, from_user_id).await {
-                    Ok(Some(token)) => {
+                // Reserved, not paired: `commit()` below is what consumes the
+                // code and mints the token, so a failed write leaves the
+                // operator's one-time secret usable.
+                match pairing.reserve_pair(code, from_user_id).await {
+                    Ok(Some(reservation)) => {
                         if let Err(e) = self.persist_allowed_identity(from_user_id).await {
-                            // Undo the pairing rather than answer with the
-                            // success reply: the write is what admits this
+                            // Answer with the failure reply rather than the
+                            // success one: the write is what admits this
                             // sender, and the spent code was their only retry.
-                            pairing.rollback_pair(code, &token);
+                            drop(reservation);
                             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"from_user_id": from_user_id, "e": e.to_string()})), "rolled back bind: could not persist bound identity");
                             let ctx = self.get_context_token(from_user_id);
                             let reply = wechat_cli_string("cli-wechat-bind-not-saved");
                             let _ = self.send_text(from_user_id, &reply, ctx.as_deref()).await;
                             return;
                         }
+                        let _ = reservation.commit();
                         let ctx = self.get_context_token(from_user_id);
                         let reply = wechat_cli_string("cli-wechat-bound-success");
                         let _ = self.send_text(from_user_id, &reply, ctx.as_deref()).await;
