@@ -187,6 +187,12 @@ pub fn is_identity_allowed_by(
         allowed
             .iter()
             .filter_map(|entry| peer_grant_identity(entry))
+            // A blank grant names nobody, so it must not match an identifier
+            // the channel could not fill in. `grants_anyone` already discards
+            // these; admission has to agree, or `external_peers = [""]`
+            // authorizes a sender whose blank alias meets the blank grant
+            // while a sibling identifier carries the real account.
+            .filter(|entry| !entry.trim().is_empty())
     };
     if grants().any(is_wildcard) {
         return true;

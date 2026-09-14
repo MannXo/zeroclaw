@@ -699,6 +699,76 @@ mod tests {
         assert!(ch.is_author_allowed("", "did:plc:alice"));
     }
 
+    /// A blank grant reached admission and matched a blank identifier.
+    ///
+    /// Driven from a real config rather than a hand-built peer vector, because
+    /// the defect is in what `channel_external_peers` emits meeting what
+    /// admission accepts: `external_peers = [""]` resolves to a blank grant,
+    /// and Bluesky judges handle and DID together, so a sender whose handle is
+    /// empty and whose DID is real cleared the all-blank identity check and was
+    /// then admitted by the blank grant.
+    #[test]
+    fn bluesky_blank_grant_from_config_admits_nobody() {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.peer_groups.insert(
+            "bluesky_default".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("bluesky.default".to_string()),
+                external_peers: vec![PeerUsername::new(String::new())],
+                ..Default::default()
+            },
+        );
+
+        let peers = config.channel_external_peers("bluesky", "default");
+        assert_eq!(
+            peers,
+            vec![String::new()],
+            "the blank grant reaches the channel"
+        );
+
+        let ch = make_channel_with_peers(peers);
+        assert!(
+            !ch.is_author_allowed("", "did:plc:unlisted"),
+            "a blank handle beside a real DID must not be admitted by a blank grant"
+        );
+        assert!(
+            !ch.is_author_allowed("alice.bsky.social", "did:plc:alice"),
+            "a blank grant names nobody, so it authorizes no named sender either"
+        );
+    }
+
+    /// The nonblank control: the same config shape with a real grant still
+    /// admits the sender it names and nobody else, so the filter above removed
+    /// only the blank entry.
+    #[test]
+    fn bluesky_named_grant_from_config_still_admits_that_sender() {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.peer_groups.insert(
+            "bluesky_default".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("bluesky.default".to_string()),
+                external_peers: vec![
+                    PeerUsername::new(String::new()),
+                    PeerUsername::new("alice.bsky.social".to_string()),
+                ],
+                ..Default::default()
+            },
+        );
+
+        let ch = make_channel_with_peers(config.channel_external_peers("bluesky", "default"));
+        assert!(ch.is_author_allowed("alice.bsky.social", "did:plc:alice"));
+        assert!(
+            !ch.is_author_allowed("", "did:plc:unlisted"),
+            "the sibling blank entry must not admit an unnamed sender"
+        );
+    }
+
     fn make_notification(
         reason: &str,
         handle: &str,
