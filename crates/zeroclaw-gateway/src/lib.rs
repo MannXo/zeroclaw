@@ -1584,7 +1584,7 @@ pub async fn run_gateway(
 
     let state = AppState {
         config: config_state,
-        config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        config_write_lock: zeroclaw_config::write_lock::shared_config_write_lock(),
         model_provider,
         model,
         temperature,

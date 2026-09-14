@@ -261,9 +261,17 @@ pub(crate) fn merge_external_peer(
 ///
 /// The publish re-runs the same merge against the live config rather than
 /// installing the staged clone, so an unrelated edit made while the save was in
-/// flight is preserved. The saved *file* is still last-writer-wins, which is
-/// `Config::save`'s pre-existing contract and not something this writer can
-/// narrow on its own.
+/// flight is preserved.
+///
+/// The whole transaction is serialized on
+/// [`zeroclaw_config::write_lock::shared_config_write_lock`], acquired before
+/// the read-for-modify and held through the publish. Preserving the live edit
+/// was never enough on its own: `Config::save` syncs the staged snapshot onto
+/// the existing document and drops keys the snapshot does not carry, so a
+/// writer that added an `ignore` and saved it between the clone and the save
+/// had that deny erased from `config.toml`. The live merge cannot undo a file
+/// already written, and the next load authorizes the account the operator just
+/// denied.
 ///
 /// Idempotent: an already-authorized identity returns without writing, so
 /// callers may invoke this on every connect/reconnect. `persist = None`
@@ -301,6 +309,12 @@ pub(crate) async fn persist_external_peer(
         );
         return Ok(());
     };
+    // Held across the read, the save and the publish. Lock order is this mutex
+    // first, the config `RwLock` second; both guards below are taken and
+    // dropped inside it.
+    let _write_guard = zeroclaw_config::write_lock::shared_config_write_lock()
+        .lock_owned()
+        .await;
     let staged = {
         let cfg = config.read();
         let mut staged = cfg.clone();
@@ -788,9 +802,17 @@ mod tests {
     /// that vanished on restart.
     #[tokio::test]
     async fn failed_save_leaves_no_grant_and_the_retry_still_persists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The config's parent directory is an existing regular file, so
+        // `create_dir_all` in the atomic writer fails on every platform.
+        // A path under a non-existent root does not: `/nonexistent-.../` is
+        // creatable on the Windows runner, so the expected save error never
+        // occurred there and the test failed for the wrong reason.
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"").expect("create the blocking file");
+        let config_path = blocker.join("config.toml");
         let mut config = config_with_whatsapp("admin");
-        // A parent directory that does not exist, so the write cannot land.
-        config.config_path = std::path::PathBuf::from("/nonexistent-zeroclaw-9428/config.toml");
+        config.config_path = config_path.clone();
         let shared = Arc::new(parking_lot::RwLock::new(config));
 
         let first =
@@ -820,6 +842,18 @@ mod tests {
                 .channel_external_peers("whatsapp", "admin")
                 .is_empty(),
             "still nothing authorized after the second failure"
+        );
+
+        // Repointed at a writable path the same call succeeds, so the two
+        // failures above came from the unwritable location and not from a
+        // writer that could never have persisted anything.
+        shared.write().config_path = dir.path().join("config.toml");
+        persist_external_peer(Some(&shared), "whatsapp", "admin", "+15551234567", exact)
+            .await
+            .expect("the retry persists once the path is writable");
+        assert_eq!(
+            shared.read().channel_external_peers("whatsapp", "admin"),
+            vec!["+15551234567".to_string()]
         );
     }
 
@@ -859,6 +893,162 @@ mod tests {
         assert_eq!(
             authorizing_group_key(&config, "whatsapp", "admin", "+15559999999", exact),
             None
+        );
+    }
+
+    /// A deny written by a competing config writer must survive a pairing bind,
+    /// on disk and not only in memory.
+    ///
+    /// `Config::save` syncs the staged snapshot onto the existing document and
+    /// drops keys the snapshot does not carry, so pairing's save used to write
+    /// the pre-deny policy back over the file. Publishing the merge into the
+    /// live config kept the deny in memory and could not undo the file, so the
+    /// next load authorized the account the operator had just denied.
+    ///
+    /// The interleaving is forced rather than raced: the test holds the shared
+    /// config write lock the way a gateway handler does, so the spawned pairing
+    /// transaction cannot take its snapshot until the competing `ignore` has
+    /// been published and saved.
+    #[tokio::test]
+    async fn a_competing_ignore_survives_a_pairing_write() {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let mut config = config_with_whatsapp("admin");
+        config.config_path = config_path.clone();
+        config.save().await.expect("seed the config file");
+        let shared = Arc::new(parking_lot::RwLock::new(config));
+
+        let guard = zeroclaw_config::write_lock::shared_config_write_lock()
+            .lock_owned()
+            .await;
+
+        let pairing = {
+            let shared = Arc::clone(&shared);
+            zeroclaw_spawn::spawn!(async move {
+                persist_external_peer(Some(&shared), "whatsapp", "admin", "+15551234567", exact)
+                    .await
+            })
+        };
+
+        // Let the task reach the lock and block there.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !pairing.is_finished(),
+            "pairing must not run its transaction while another writer holds the lock"
+        );
+
+        // The competing writer, in the shape the gateway uses: mutate the live
+        // config, then save the whole snapshot.
+        {
+            let mut cfg = shared.write();
+            cfg.peer_groups.insert(
+                "whatsapp_admin_denies".to_string(),
+                PeerGroupConfig {
+                    channel: ChannelRef::new("whatsapp.admin".to_string()),
+                    ignore: vec![PeerUsername::new("+15559999999".to_string())],
+                    ..Default::default()
+                },
+            );
+        }
+        let competing = shared.read().clone();
+        competing.save().await.expect("the competing save lands");
+
+        drop(guard);
+        pairing
+            .await
+            .expect("the pairing task joins")
+            .expect("pairing persists once the lock is free");
+
+        let on_disk: Config = toml::from_str(
+            &std::fs::read_to_string(&config_path).expect("config.toml is readable"),
+        )
+        .expect("config.toml round-trips");
+
+        let peers = on_disk.channel_external_peers("whatsapp", "admin");
+        assert!(
+            peers.iter().any(|p| p == "!+15559999999"),
+            "the competing deny must still be on disk after pairing saved: {peers:?}"
+        );
+        assert!(
+            peers.iter().any(|p| p == "+15551234567"),
+            "and pairing's own grant must have landed too: {peers:?}"
+        );
+    }
+
+    /// A deny that lands mid-transaction and names the identity being paired
+    /// must stop the bind, not be written over.
+    ///
+    /// `pairing_deny_conflict` already refused a deny it could see. It could
+    /// not see this one: the snapshot was taken before the competing write, so
+    /// the guard ran against stale state and the bind proceeded. Taking the
+    /// snapshot under the write lock is what makes the existing guard effective
+    /// against a concurrent writer.
+    #[tokio::test]
+    async fn a_competing_ignore_naming_the_paired_identity_blocks_the_bind() {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let mut config = config_with_whatsapp("admin");
+        config.config_path = config_path.clone();
+        config.save().await.expect("seed the config file");
+        let shared = Arc::new(parking_lot::RwLock::new(config));
+
+        let guard = zeroclaw_config::write_lock::shared_config_write_lock()
+            .lock_owned()
+            .await;
+
+        let pairing = {
+            let shared = Arc::clone(&shared);
+            zeroclaw_spawn::spawn!(async move {
+                persist_external_peer(Some(&shared), "whatsapp", "admin", "+15551234567", exact)
+                    .await
+            })
+        };
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        {
+            let mut cfg = shared.write();
+            cfg.peer_groups.insert(
+                "whatsapp_admin_denies".to_string(),
+                PeerGroupConfig {
+                    channel: ChannelRef::new("whatsapp.admin".to_string()),
+                    ignore: vec![PeerUsername::new("+15551234567".to_string())],
+                    ..Default::default()
+                },
+            );
+        }
+        // Bound before the await: a `parking_lot` read guard must not be held
+        // across one.
+        let competing = shared.read().clone();
+        competing.save().await.expect("the competing save lands");
+
+        drop(guard);
+        let err = pairing
+            .await
+            .expect("the pairing task joins")
+            .expect_err("a denied identity must not be bound");
+        assert!(
+            err.to_string().contains("denied by an `ignore` entry"),
+            "the operator is told what to edit: {err}"
+        );
+
+        let on_disk: Config = toml::from_str(
+            &std::fs::read_to_string(&config_path).expect("config.toml is readable"),
+        )
+        .expect("config.toml round-trips");
+        let peers = on_disk.channel_external_peers("whatsapp", "admin");
+        assert!(
+            !peers.iter().any(|p| p == "+15551234567"),
+            "no grant for the denied identity reached disk: {peers:?}"
         );
     }
 
