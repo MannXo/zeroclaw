@@ -315,16 +315,27 @@ pub(crate) async fn persist_external_peer(
     let _write_guard = zeroclaw_config::write_lock::shared_config_write_lock()
         .lock_owned()
         .await;
-    let staged = {
-        let cfg = config.read();
-        let mut staged = cfg.clone();
-        if merge_external_peer(&mut staged, channel_type, alias, identity, &match_fn)?.is_none() {
-            return Ok(());
-        }
-        staged
-    };
+    let mut staged = config.read().clone();
+    // The daemon gives the gateway, the RPC path and the channels separate
+    // `Config` copies of the same file, so the lock alone is not enough: this
+    // handle's `peer_groups` can be older than what another writer has already
+    // saved, and pairing would then check denies against stale policy and write
+    // that policy back over the newer one. Re-read the persisted policy under
+    // the lock so both the deny check and the merge target are authoritative.
+    if let Some(persisted) = persisted_peer_groups(&staged.config_path).await? {
+        staged.peer_groups = persisted;
+    }
+    if merge_external_peer(&mut staged, channel_type, alias, identity, &match_fn)?.is_none() {
+        return Ok(());
+    }
+    // Incremental: only `peer_groups` is applied onto the current on-disk
+    // document, so the rest of this snapshot — which is still whatever this
+    // handle last saw — cannot drop another writer's keys. The refresh above is
+    // what makes this sufficient; on its own it would still rewrite the policy
+    // table from stale state.
+    staged.mark_dirty("peer_groups");
     staged
-        .save()
+        .save_dirty()
         .await
         .with_context(|| format!("Failed to persist {channel_type} peer to config.toml"))?;
     {
@@ -332,6 +343,42 @@ pub(crate) async fn persist_external_peer(
         merge_external_peer(&mut cfg, channel_type, alias, identity, &match_fn)?;
     }
     Ok(())
+}
+
+/// The `peer_groups` table as it is on disk right now, or `None` when the file
+/// does not exist yet and the in-memory copy is all there is.
+///
+/// Only the policy table is taken. Reloading the whole `Config` would pull the
+/// secret, env-override and 1Password snapshot state that `save` depends on
+/// through a second decrypt cycle, and pairing has no business rewriting any of
+/// it; `peer_groups` is the entire surface `merge_external_peer` reads and
+/// writes.
+async fn persisted_peer_groups(
+    config_path: &std::path::Path,
+) -> anyhow::Result<
+    Option<std::collections::HashMap<String, zeroclaw_config::multi_agent::PeerGroupConfig>>,
+> {
+    use anyhow::Context;
+
+    if !tokio::fs::try_exists(config_path).await.unwrap_or(false) {
+        return Ok(None);
+    }
+    let raw = tokio::fs::read_to_string(config_path)
+        .await
+        .with_context(|| format!("Failed to read {} for pairing", config_path.display()))?;
+    let doc: toml::Table = raw
+        .parse()
+        .with_context(|| format!("Failed to parse {} for pairing", config_path.display()))?;
+    let Some(table) = doc.get("peer_groups") else {
+        // The file exists and declares no groups, which is a policy of "none"
+        // and must not be confused with "could not read it".
+        return Ok(Some(std::collections::HashMap::new()));
+    };
+    let groups = table
+        .clone()
+        .try_into()
+        .context("Failed to deserialize [peer_groups] from config.toml")?;
+    Ok(Some(groups))
 }
 
 #[cfg(test)]
@@ -977,6 +1024,140 @@ mod tests {
         assert!(
             peers.iter().any(|p| p == "+15551234567"),
             "and pairing's own grant must have landed too: {peers:?}"
+        );
+    }
+
+    /// The production split: the gateway/RPC copy of `Config` and the channel
+    /// copy are *different* values over the same file, so serializing the
+    /// writers is not enough. A deny saved through one handle is invisible to
+    /// the other, and pairing used to check denies against that stale policy
+    /// and then write it back over the file, erasing a security decision the
+    /// operator had already saved.
+    ///
+    /// `a_competing_ignore_survives_a_pairing_write` cannot catch this: both of
+    /// its writers share one `Arc<RwLock<Config>>`, so pairing's snapshot sees
+    /// the deny for free. Here the channel handle never sees it, and the repair
+    /// has to come from re-reading the persisted policy under the lock.
+    #[tokio::test]
+    async fn a_deny_saved_through_a_separate_handle_survives_and_blocks_the_bind() {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+
+        let mut seed = config_with_whatsapp("admin");
+        seed.config_path = config_path.clone();
+        seed.save().await.expect("seed the config file");
+
+        // Two independent handles over the same file, as the daemon builds them.
+        let mut gateway = seed.clone();
+        let channel = Arc::new(parking_lot::RwLock::new(seed.clone()));
+
+        // The operator denies an account through the gateway and it lands.
+        gateway.peer_groups.insert(
+            "whatsapp_admin_denies".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("whatsapp.admin".to_string()),
+                ignore: vec![PeerUsername::new("+15559999999".to_string())],
+                ..Default::default()
+            },
+        );
+        gateway.save().await.expect("the deny save lands");
+
+        // The channel handle is stale, which is the whole point.
+        assert!(
+            !channel
+                .read()
+                .peer_groups
+                .contains_key("whatsapp_admin_denies"),
+            "the channel handle must not have seen the gateway's write"
+        );
+
+        // Pairing the denied account must be refused, from the file rather than
+        // from this handle's memory.
+        let refused =
+            persist_external_peer(Some(&channel), "whatsapp", "admin", "+15559999999", exact).await;
+        assert!(
+            refused.is_err(),
+            "a denied identity must not bind through a stale handle"
+        );
+
+        // An unrelated account still pairs, and the deny must survive that write.
+        persist_external_peer(Some(&channel), "whatsapp", "admin", "+15551234567", exact)
+            .await
+            .expect("an undenied bind still persists");
+
+        let on_disk: Config = toml::from_str(
+            &std::fs::read_to_string(&config_path).expect("config.toml is readable"),
+        )
+        .expect("config.toml round-trips");
+
+        let peers = on_disk.channel_external_peers("whatsapp", "admin");
+        assert!(
+            peers.iter().any(|p| p == "!+15559999999"),
+            "the deny saved through the other handle must still be on disk: {peers:?}"
+        );
+        assert!(
+            peers.iter().any(|p| p == "+15551234567"),
+            "and the undenied grant must have landed: {peers:?}"
+        );
+    }
+
+    /// The other half of the same repair: pairing writes `peer_groups`
+    /// incrementally, so a snapshot that predates another writer cannot drop
+    /// the keys it never saw.
+    ///
+    /// Refreshing the policy alone would not cover this — the refresh only
+    /// touches `peer_groups`, while a full `Config::save` rewrites the entire
+    /// document from the stale snapshot.
+    #[tokio::test]
+    async fn a_pairing_write_through_a_stale_handle_keeps_keys_it_never_saw() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+
+        let mut seed = config_with_whatsapp("admin");
+        seed.config_path = config_path.clone();
+        seed.save().await.expect("seed the config file");
+
+        let mut gateway = seed.clone();
+        let channel = Arc::new(parking_lot::RwLock::new(seed.clone()));
+
+        // A second channel instance is configured through the gateway, outside
+        // `peer_groups` entirely.
+        gateway.channels.whatsapp.insert(
+            "ops".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        gateway.save().await.expect("the gateway save lands");
+
+        assert!(
+            !channel.read().channels.whatsapp.contains_key("ops"),
+            "the channel handle must not have seen the new instance"
+        );
+
+        persist_external_peer(Some(&channel), "whatsapp", "admin", "+15551234567", exact)
+            .await
+            .expect("pairing persists");
+
+        let on_disk: Config = toml::from_str(
+            &std::fs::read_to_string(&config_path).expect("config.toml is readable"),
+        )
+        .expect("config.toml round-trips");
+
+        assert!(
+            on_disk.channels.whatsapp.contains_key("ops"),
+            "pairing must not drop a key its snapshot predates"
+        );
+        assert!(
+            on_disk
+                .channel_external_peers("whatsapp", "admin")
+                .iter()
+                .any(|p| p == "+15551234567"),
+            "and pairing's own grant must still have landed"
         );
     }
 
