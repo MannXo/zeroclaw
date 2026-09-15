@@ -20797,10 +20797,27 @@ impl Config {
         // Voice delivery is delivery, so the same `ignore` that denies a sender
         // has to remove them here. This walked `external_peers` directly and
         // never consulted `ignore` at all, so an explicitly ignored peer still
-        // received proactive TTS. Filtered through the addressable view rather
-        // than re-deriving the rule, so the two cannot answer differently.
-        let addressable = self.channel_addressable_peers(channel_type, alias);
-        out.retain(|peer| addressable.iter().any(|allowed| allowed == peer));
+        // received proactive TTS.
+        //
+        // Subtract the denies directly rather than filtering through
+        // `channel_addressable_peers`: that view answers a different question
+        // ("which concrete account can we address") and so drops `*` on
+        // purpose, which silently deleted a wildcard voice grant and sent every
+        // sender back to the room-membership fallback.
+        let resolved = self.channel_external_peers(channel_type, alias);
+        let denied: std::collections::HashSet<String> = resolved
+            .iter()
+            .filter_map(|peer| peer_deny_identity(peer))
+            .map(|peer| peer.trim().trim_start_matches('@').to_lowercase())
+            .collect();
+        // `ignore = ["*"]` denies every sender, so nothing is voiced.
+        if denied.iter().any(|peer| peer == "*") {
+            return Vec::new();
+        }
+        out.retain(|peer| {
+            peer.trim() == "*"
+                || !denied.contains(&peer.trim().trim_start_matches('@').to_lowercase())
+        });
         out
     }
 
