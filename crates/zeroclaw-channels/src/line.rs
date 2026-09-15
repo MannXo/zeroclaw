@@ -2695,7 +2695,14 @@ mod tests {
             .mount(&api_server)
             .await;
 
-        let mut config = Config::default();
+        // Isolated: `Config::default()` resolves `config_path` to the real
+        // `~/.zeroclaw/config.toml`, and a bind that persists would read and
+        // rewrite the operator's own file.
+        let cfg_dir = tempfile::tempdir().expect("tempdir");
+        let mut config = Config {
+            config_path: cfg_dir.path().join("config.toml"),
+            ..Default::default()
+        };
         config.channels.line.insert(
             "line_test_alias".to_string(),
             zeroclaw_config::schema::LineConfig {
@@ -2783,7 +2790,14 @@ mod tests {
             .mount(&api_server)
             .await;
 
-        let mut config = Config::default();
+        // Isolated: `Config::default()` resolves `config_path` to the real
+        // `~/.zeroclaw/config.toml`, and a bind that persists would read and
+        // rewrite the operator's own file.
+        let cfg_dir = tempfile::tempdir().expect("tempdir");
+        let mut config = Config {
+            config_path: cfg_dir.path().join("config.toml"),
+            ..Default::default()
+        };
         config.channels.line.insert(
             "line_test_alias".to_string(),
             zeroclaw_config::schema::LineConfig {

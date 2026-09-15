@@ -3033,7 +3033,14 @@ mod tests {
         let state_dir = tempfile::tempdir().expect("temp state dir");
 
         let build = |ignored: bool| {
-            let mut config = zeroclaw_config::schema::Config::default();
+            // Isolated: `Config::default()` resolves `config_path` to the real
+            // `~/.zeroclaw/config.toml`, and a bind that persists would read and
+            // rewrite the operator's own file.
+            let cfg_dir = tempfile::tempdir().expect("tempdir");
+            let mut config = zeroclaw_config::schema::Config {
+                config_path: cfg_dir.path().join("config.toml"),
+                ..Default::default()
+            };
             config.channels.wechat.insert(
                 "admin".to_string(),
                 zeroclaw_config::schema::WeChatConfig {
@@ -3113,7 +3120,14 @@ mod tests {
             .await;
         let state_dir = tempfile::tempdir().expect("temp state dir");
 
-        let mut config = zeroclaw_config::schema::Config::default();
+        // Isolated: `Config::default()` resolves `config_path` to the real
+        // `~/.zeroclaw/config.toml`, and a bind that persists would read and
+        // rewrite the operator's own file.
+        let cfg_dir = tempfile::tempdir().expect("tempdir");
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: cfg_dir.path().join("config.toml"),
+            ..Default::default()
+        };
         config.channels.wechat.insert(
             "admin".to_string(),
             zeroclaw_config::schema::WeChatConfig {

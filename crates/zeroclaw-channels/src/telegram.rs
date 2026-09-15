@@ -7678,7 +7678,14 @@ mod tests {
         // The other end of the re-enabled prompt. Pairing is offered again once
         // a shadowed grant stops counting as authorization, so the bind must not
         // dead-end by appending a grant the same `ignore` shadows.
-        let mut config = Config::default();
+        // Isolated: `Config::default()` resolves `config_path` to the real
+        // `~/.zeroclaw/config.toml`, and a bind that persists would read and
+        // rewrite the operator's own file.
+        let cfg_dir = tempfile::tempdir().expect("tempdir");
+        let mut config = Config {
+            config_path: cfg_dir.path().join("config.toml"),
+            ..Default::default()
+        };
         config.channels.telegram.insert(
             "default".to_string(),
             zeroclaw_config::schema::TelegramConfig {
@@ -7748,8 +7755,15 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        // Isolated for the same reason as the tests above; the guard lives in
+        // the test scope so every config the closure builds shares one dir.
+        let cfg_dir = tempfile::tempdir().expect("tempdir");
+        let cfg_path = cfg_dir.path().join("config.toml");
         let config_with = |ignored: bool| {
-            let mut config = Config::default();
+            let mut config = Config {
+                config_path: cfg_path.clone(),
+                ..Default::default()
+            };
             config.channels.telegram.insert(
                 "default".to_string(),
                 zeroclaw_config::schema::TelegramConfig {
@@ -7829,7 +7843,14 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let mut config = Config::default();
+        // Isolated: `Config::default()` resolves `config_path` to the real
+        // `~/.zeroclaw/config.toml`, and a bind that persists would read and
+        // rewrite the operator's own file.
+        let cfg_dir = tempfile::tempdir().expect("tempdir");
+        let mut config = Config {
+            config_path: cfg_dir.path().join("config.toml"),
+            ..Default::default()
+        };
         config.channels.telegram.insert(
             "default".to_string(),
             zeroclaw_config::schema::TelegramConfig {
@@ -7908,7 +7929,14 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let mut config = Config::default();
+        // Isolated: `Config::default()` resolves `config_path` to the real
+        // `~/.zeroclaw/config.toml`, and a bind that persists would read and
+        // rewrite the operator's own file.
+        let cfg_dir = tempfile::tempdir().expect("tempdir");
+        let mut config = Config {
+            config_path: cfg_dir.path().join("config.toml"),
+            ..Default::default()
+        };
         config.channels.telegram.insert(
             "default".to_string(),
             zeroclaw_config::schema::TelegramConfig {
