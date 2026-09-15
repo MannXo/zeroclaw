@@ -3763,6 +3763,7 @@ mod tests {
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
                 debounce_ms: None,
+                per_user_session: true,
             },
         );
         config.peer_groups.insert(
