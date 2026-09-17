@@ -63,7 +63,6 @@ struct CompletedWalk {
     newest_unread: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Deserialize)]
 struct Notification {
     uri: String,
