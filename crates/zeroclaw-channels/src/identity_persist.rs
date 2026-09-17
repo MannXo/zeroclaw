@@ -353,6 +353,13 @@ pub(crate) async fn persist_external_peer(
 /// through a second decrypt cycle, and pairing has no business rewriting any of
 /// it; `peer_groups` is the entire surface `merge_external_peer` reads and
 /// writes.
+#[cfg(any(
+    feature = "channel-telegram",
+    feature = "channel-line",
+    feature = "channel-wechat",
+    feature = "whatsapp-web",
+    test
+))]
 async fn persisted_peer_groups(
     config_path: &std::path::Path,
 ) -> anyhow::Result<
