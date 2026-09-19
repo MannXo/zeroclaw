@@ -480,6 +480,22 @@ pub async fn handle_api_channel_bind(
 
     let mut working = state.config.read().clone();
 
+    // The daemon gives the gateway, the RPC path and the channels separate
+    // `Config` copies of the same file, so `_cfg_guard` alone is not enough:
+    // this handle's `peer_groups` can be older than what another writer has
+    // already saved. Without the refresh, an `ignore` persisted through RPC is
+    // both invisible to the bind check below and overwritten by the save.
+    match zeroclaw_config::schema::persisted_peer_groups(&working.config_path).await {
+        Ok(Some(persisted)) => working.peer_groups = persisted,
+        Ok(None) => {}
+        Err(e) => {
+            return error_response(ConfigApiError::new(
+                ConfigApiCode::ReloadFailed,
+                format!("could not read the persisted peer policy: {e}"),
+            ));
+        }
+    }
+
     // Reject a phantom alias loudly (404) rather than minting a peer group the
     // runtime never reads.
     if !zeroclaw_channels::orchestrator::channel_alias_configured(&working, channel_type, alias) {
@@ -531,13 +547,15 @@ pub async fn handle_api_channel_bind(
         .into_response();
     };
 
-    // Persist with a full `save` (the same path the CLI bind uses), NOT the
-    // incremental `save_dirty` behind `persist_and_swap`: a direct peer-group
-    // mutation isn't dirty-tracked, so `save_dirty` would never write it to
-    // disk (the bind would vanish on restart), and `save` also correctly
-    // materializes a brand-new peer-group table. Then swap the shared
-    // in-memory config so the running channel authorizes the peer live.
-    if let Err(e) = working.save().await {
+    // Incremental: only `peer_groups` is applied onto the current on-disk
+    // document, so the rest of this snapshot, which is still whatever this
+    // handle last saw, cannot drop another writer's keys. A full `save` here
+    // wrote the whole stale snapshot back. A direct peer-group mutation is not
+    // dirty-tracked, so the explicit `mark_dirty` is what makes `save_dirty`
+    // write it at all, and it materializes a brand-new table the same way.
+    // Then swap the shared in-memory config so the channel authorizes live.
+    working.mark_dirty("peer_groups");
+    if let Err(e) = working.save_dirty().await {
         return error_response(ConfigApiError::new(
             ConfigApiCode::ReloadFailed,
             format!("save failed: {e}"),
@@ -4490,6 +4508,112 @@ mod tests {
                 .read()
                 .channel_external_peers("telegram", "alerts")
                 .contains(&"123456789".to_string())
+        );
+    }
+
+    /// The gateway and the RPC path hold separate `Config` copies of one file.
+    /// An `ignore` saved through RPC is therefore absent from the gateway's
+    /// snapshot, and a bind that trusted that snapshot both missed the deny and
+    /// wrote the stale policy table back over it. The handler re-reads the
+    /// persisted `peer_groups` under the write lock instead, so the deny is
+    /// authoritative for the check and survives the save.
+    #[tokio::test]
+    async fn channel_bind_refuses_a_deny_only_the_other_handle_has_saved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gateway_config = config_with_telegram_alias(&tmp, "alerts");
+        let config_path = gateway_config.config_path.clone();
+
+        // What the RPC handle persisted after the gateway took its snapshot.
+        // The gateway's own copy still has no `peer_groups` at all.
+        std::fs::write(
+            &config_path,
+            "[peer_groups.telegram_alerts]\n\
+             channel = \"telegram.alerts\"\n\
+             ignore = [\"999999999\"]\n",
+        )
+        .unwrap();
+
+        let state = test_state(gateway_config);
+        assert!(
+            state.config.read().peer_groups.is_empty(),
+            "the gateway snapshot must start stale for this to test anything"
+        );
+
+        let (status, _json) = response_json(
+            handle_api_channel_bind(
+                axum::extract::State(state.clone()),
+                axum::http::HeaderMap::new(),
+                axum::Json(ChannelBindBody {
+                    channel_type: "telegram".to_string(),
+                    alias: "alerts".to_string(),
+                    identity: "999999999".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a deny this handle had not seen must still refuse the bind"
+        );
+        let on_disk = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            on_disk.contains("999999999"),
+            "the persisted deny must survive, got:\n{on_disk}"
+        );
+    }
+
+    /// The other half: an unrelated bind still succeeds, and it must not drop
+    /// the deny the gateway's snapshot never carried.
+    #[tokio::test]
+    async fn channel_bind_preserves_a_deny_saved_by_the_other_handle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gateway_config = config_with_telegram_alias(&tmp, "alerts");
+        let config_path = gateway_config.config_path.clone();
+
+        // `sops_dir` stands in for any unrelated key another writer persisted
+        // after this handle took its snapshot. A full `save` of the stale
+        // snapshot would drop it along with the deny.
+        std::fs::write(
+            &config_path,
+            "sops_dir = \"/srv/written-by-the-other-handle\"\n\
+             \n\
+             [peer_groups.telegram_alerts]\n\
+             channel = \"telegram.alerts\"\n\
+             ignore = [\"999999999\"]\n",
+        )
+        .unwrap();
+
+        let state = test_state(gateway_config);
+        let (status, _json) = response_json(
+            handle_api_channel_bind(
+                axum::extract::State(state.clone()),
+                axum::http::HeaderMap::new(),
+                axum::Json(ChannelBindBody {
+                    channel_type: "telegram".to_string(),
+                    alias: "alerts".to_string(),
+                    identity: "123456789".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let on_disk = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            on_disk.contains("123456789"),
+            "the new grant must be persisted, got:\n{on_disk}"
+        );
+        assert!(
+            on_disk.contains("999999999"),
+            "the other handle's deny must not be erased, got:\n{on_disk}"
+        );
+        assert!(
+            on_disk.contains("/srv/written-by-the-other-handle"),
+            "an unrelated persisted key must survive the bind, got:\n{on_disk}"
         );
     }
 

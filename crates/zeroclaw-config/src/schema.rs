@@ -20774,6 +20774,45 @@ pub fn peer_deny_marker(identity: &str) -> String {
     )
 }
 
+/// The `peer_groups` table as it is on disk right now, or `None` when the file
+/// does not exist yet and the in-memory copy is all there is.
+///
+/// Only the policy table is taken. Reloading the whole `Config` would pull the
+/// secret, env-override and 1Password snapshot state that `save` depends on
+/// through a second decrypt cycle, and a peer-group write has no business
+/// rewriting any of it.
+///
+/// Every writer of a peer group needs this: the daemon gives the gateway, the
+/// RPC path and the channels separate `Config` copies of the same file, so
+/// holding the shared write lock is not sufficient on its own. A handle's
+/// `peer_groups` can be older than what another writer already saved, and the
+/// write would then check policy against stale state and persist it back over
+/// the newer table.
+pub async fn persisted_peer_groups(
+    config_path: &std::path::Path,
+) -> anyhow::Result<Option<std::collections::HashMap<String, crate::multi_agent::PeerGroupConfig>>>
+{
+    if !tokio::fs::try_exists(config_path).await.unwrap_or(false) {
+        return Ok(None);
+    }
+    let raw = tokio::fs::read_to_string(config_path)
+        .await
+        .with_context(|| format!("Failed to read {}", config_path.display()))?;
+    let doc: toml::Table = raw
+        .parse()
+        .with_context(|| format!("Failed to parse {}", config_path.display()))?;
+    let Some(table) = doc.get("peer_groups") else {
+        // The file exists and declares no groups, which is a policy of "none"
+        // and must not be confused with "could not read it".
+        return Ok(Some(std::collections::HashMap::new()));
+    };
+    let groups = table
+        .clone()
+        .try_into()
+        .context("Failed to deserialize [peer_groups] from config.toml")?;
+    Ok(Some(groups))
+}
+
 /// Whether a peer entry is the wildcard.
 #[must_use]
 pub fn peer_is_wildcard(entry: &str) -> bool {

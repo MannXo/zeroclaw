@@ -322,7 +322,9 @@ pub(crate) async fn persist_external_peer(
     // saved, and pairing would then check denies against stale policy and write
     // that policy back over the newer one. Re-read the persisted policy under
     // the lock so both the deny check and the merge target are authoritative.
-    if let Some(persisted) = persisted_peer_groups(&staged.config_path).await? {
+    if let Some(persisted) =
+        zeroclaw_config::schema::persisted_peer_groups(&staged.config_path).await?
+    {
         staged.peer_groups = persisted;
     }
     if merge_external_peer(&mut staged, channel_type, alias, identity, &match_fn)?.is_none() {
@@ -343,49 +345,6 @@ pub(crate) async fn persist_external_peer(
         merge_external_peer(&mut cfg, channel_type, alias, identity, &match_fn)?;
     }
     Ok(())
-}
-
-/// The `peer_groups` table as it is on disk right now, or `None` when the file
-/// does not exist yet and the in-memory copy is all there is.
-///
-/// Only the policy table is taken. Reloading the whole `Config` would pull the
-/// secret, env-override and 1Password snapshot state that `save` depends on
-/// through a second decrypt cycle, and pairing has no business rewriting any of
-/// it; `peer_groups` is the entire surface `merge_external_peer` reads and
-/// writes.
-#[cfg(any(
-    feature = "channel-telegram",
-    feature = "channel-line",
-    feature = "channel-wechat",
-    feature = "whatsapp-web",
-    test
-))]
-async fn persisted_peer_groups(
-    config_path: &std::path::Path,
-) -> anyhow::Result<
-    Option<std::collections::HashMap<String, zeroclaw_config::multi_agent::PeerGroupConfig>>,
-> {
-    use anyhow::Context;
-
-    if !tokio::fs::try_exists(config_path).await.unwrap_or(false) {
-        return Ok(None);
-    }
-    let raw = tokio::fs::read_to_string(config_path)
-        .await
-        .with_context(|| format!("Failed to read {} for pairing", config_path.display()))?;
-    let doc: toml::Table = raw
-        .parse()
-        .with_context(|| format!("Failed to parse {} for pairing", config_path.display()))?;
-    let Some(table) = doc.get("peer_groups") else {
-        // The file exists and declares no groups, which is a policy of "none"
-        // and must not be confused with "could not read it".
-        return Ok(Some(std::collections::HashMap::new()));
-    };
-    let groups = table
-        .clone()
-        .try_into()
-        .context("Failed to deserialize [peer_groups] from config.toml")?;
-    Ok(Some(groups))
 }
 
 #[cfg(test)]
