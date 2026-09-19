@@ -17,7 +17,10 @@ pub enum Match {
 /// spellings name the same account. Re-exported from the producing crate so the
 /// two halves of the contract cannot drift.
 pub use zeroclaw_config::schema::PEER_DENY_PREFIX as DENY_PREFIX;
-use zeroclaw_config::schema::{peer_deny_identity, peer_grant_identity};
+use zeroclaw_config::schema::{
+    peer_deny_identity, peer_deny_names, peer_grant_identity, peer_is_wildcard, peer_policy_admits,
+    peer_policy_denies,
+};
 
 /// Whether a resolved peer list can admit anybody at all.
 ///
@@ -42,7 +45,7 @@ pub fn grants_anyone(allowed: &[String]) -> bool {
         .filter_map(|entry| peer_deny_identity(entry))
         .collect();
     // `ignore = ["*"]` denies every sender, so no grant survives it.
-    if denies.iter().any(|entry| is_wildcard(entry)) {
+    if denies.iter().any(|entry| peer_is_wildcard(entry)) {
         return false;
     }
     allowed
@@ -56,10 +59,10 @@ pub fn grants_anyone(allowed: &[String]) -> bool {
         .any(|grant| {
             // A wildcard grant outlives any named deny: every sender the denies
             // do not name still rides it.
-            is_wildcard(grant)
-                || !denies
-                    .iter()
-                    .any(|deny| deny_names(deny, grant, &|entry: &str, user: &str| entry == user))
+            peer_is_wildcard(grant)
+                || !denies.iter().any(|deny| {
+                    peer_deny_names(deny, grant, &|entry: &str, user: &str| entry == user)
+                })
         })
 }
 
@@ -95,40 +98,6 @@ pub fn pairing_deny_conflict(
     })
 }
 
-/// Whether a grant entry admits every sender.
-///
-/// Trimmed, because an operator writing `external_peers = [" * "]` means the
-/// wildcard, and a channel matcher that trims would honour it as one while an
-/// exact comparison here would not.
-fn is_wildcard(entry: &str) -> bool {
-    entry.trim() == "*"
-}
-
-/// Whether a deny entry names `user`.
-///
-/// A deny rule is checked with the caller's own notion of identity *and* with a
-/// normalized comparison (leading `@` stripped, ASCII case-insensitive). A
-/// blocklist errs toward denying, so matching a superset is the safe direction:
-/// the alternative admits a sender the operator wrote down.
-fn deny_names(entry: &str, user: &str, match_fn: &impl Fn(&str, &str) -> bool) -> bool {
-    // `ignore = ["*"]` denies every sender, the mirror of a wildcard grant.
-    if is_wildcard(entry) {
-        return true;
-    }
-    let normalize = |value: &str| value.trim().trim_start_matches('@').to_string();
-    match_fn(entry, user) || normalize(entry).eq_ignore_ascii_case(&normalize(user))
-}
-
-/// Whether any deny entry in `allowed` names `user`.
-///
-/// Evaluated before the wildcard so an explicit deny always wins.
-fn is_user_denied(allowed: &[String], user: &str, match_fn: &impl Fn(&str, &str) -> bool) -> bool {
-    allowed
-        .iter()
-        .filter_map(|entry| peer_deny_identity(entry))
-        .any(|entry| deny_names(entry, user, match_fn))
-}
-
 fn matcher_for(mode: Match) -> impl Fn(&str, &str) -> bool {
     move |entry: &str, user: &str| match mode {
         Match::Sensitive => entry == user,
@@ -150,9 +119,7 @@ pub fn is_identity_denied_by(
     identities: &[&str],
     match_fn: impl Fn(&str, &str) -> bool,
 ) -> bool {
-    identities
-        .iter()
-        .any(|user| is_user_denied(allowed, user, &match_fn))
+    peer_policy_denies(allowed, identities, match_fn)
 }
 
 /// Whether an account is authorized, evaluated across every identifier it is
@@ -170,34 +137,7 @@ pub fn is_identity_allowed_by(
     identities: &[&str],
     match_fn: impl Fn(&str, &str) -> bool,
 ) -> bool {
-    // An account the channel could not identify is not authorized, wildcard or
-    // not: there is nothing for a deny rule to name. Blank identifiers are the
-    // same case wearing a string: adapters substitute `""` for a missing field
-    // (Twitter for an absent `author_id`, and again for the username it falls
-    // back to), so a slice that is non-empty but carries nothing usable would
-    // otherwise reach the wildcard branch and be admitted with no identifiable
-    // sender at all.
-    if identities.iter().all(|user| user.trim().is_empty()) {
-        return false;
-    }
-    if is_identity_denied_by(allowed, identities, &match_fn) {
-        return false;
-    }
-    let grants = || {
-        allowed
-            .iter()
-            .filter_map(|entry| peer_grant_identity(entry))
-            // A blank grant names nobody, so it must not match an identifier
-            // the channel could not fill in. `grants_anyone` already discards
-            // these; admission has to agree, or `external_peers = [""]`
-            // authorizes a sender whose blank alias meets the blank grant
-            // while a sibling identifier carries the real account.
-            .filter(|entry| !entry.trim().is_empty())
-    };
-    if grants().any(is_wildcard) {
-        return true;
-    }
-    grants().any(|entry| identities.iter().any(|user| match_fn(entry, user)))
+    peer_policy_admits(allowed, identities, match_fn)
 }
 
 /// `is_identity_allowed_by` with the shared case-sensitivity selector.

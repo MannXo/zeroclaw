@@ -20774,6 +20774,88 @@ pub fn peer_deny_marker(identity: &str) -> String {
     )
 }
 
+/// Whether a peer entry is the wildcard.
+#[must_use]
+pub fn peer_is_wildcard(entry: &str) -> bool {
+    entry.trim() == "*"
+}
+
+/// Whether a deny entry names `user`.
+///
+/// A deny rule is checked with the caller's own notion of identity *and* with a
+/// normalized comparison (leading `@` stripped, ASCII case-insensitive). A
+/// blocklist errs toward denying, so matching a superset is the safe direction:
+/// the alternative admits a sender the operator wrote down.
+#[must_use]
+pub fn peer_deny_names(entry: &str, user: &str, match_fn: &impl Fn(&str, &str) -> bool) -> bool {
+    // `ignore = ["*"]` denies every sender, the mirror of a wildcard grant.
+    if peer_is_wildcard(entry) {
+        return true;
+    }
+    let normalize = |value: &str| value.trim().trim_start_matches('@').to_string();
+    match_fn(entry, user) || normalize(entry).eq_ignore_ascii_case(&normalize(user))
+}
+
+/// Whether any deny entry in a resolved peer list names any of `identities`.
+///
+/// Lives here rather than beside the channel allowlist because
+/// `channel_external_peers` produces the encoding, and consumers outside
+/// `zeroclaw-channels` have to decode it the same way. The plugin ingress in
+/// `zeroclaw-runtime` is one: `zeroclaw-channels` depends on `zeroclaw-runtime`,
+/// so it cannot reach back for the helper, and a second implementation of deny
+/// precedence on an authorization surface is the drift this codec exists to
+/// prevent.
+#[must_use]
+pub fn peer_policy_denies(
+    allowed: &[String],
+    identities: &[&str],
+    match_fn: impl Fn(&str, &str) -> bool,
+) -> bool {
+    identities.iter().any(|user| {
+        allowed
+            .iter()
+            .filter_map(|entry| peer_deny_identity(entry))
+            .any(|entry| peer_deny_names(entry, user, &match_fn))
+    })
+}
+
+/// Whether a resolved peer list authorizes an account, across every identifier
+/// it is known by. Denies are applied before any grant, including a wildcard.
+///
+/// Asking per identifier and OR-ing the answers is not equivalent: a deny names
+/// one identifier while the wildcard grants every other, so the deny goes false
+/// on its own identifier and the wildcard goes true on the next one, and the
+/// account is admitted.
+#[must_use]
+pub fn peer_policy_admits(
+    allowed: &[String],
+    identities: &[&str],
+    match_fn: impl Fn(&str, &str) -> bool,
+) -> bool {
+    // An account the channel could not identify is not authorized, wildcard or
+    // not: there is nothing for a deny rule to name. Adapters substitute `""`
+    // for a missing field, so a non-empty slice carrying nothing usable would
+    // otherwise reach the wildcard branch with no identifiable sender at all.
+    if identities.iter().all(|user| user.trim().is_empty()) {
+        return false;
+    }
+    if peer_policy_denies(allowed, identities, &match_fn) {
+        return false;
+    }
+    let grants = || {
+        allowed
+            .iter()
+            .filter_map(|entry| peer_grant_identity(entry))
+            // A blank grant names nobody, so it must not match an identifier
+            // the channel could not fill in.
+            .filter(|entry| !entry.trim().is_empty())
+    };
+    if grants().any(peer_is_wildcard) {
+        return true;
+    }
+    grants().any(|entry| identities.iter().any(|user| match_fn(entry, user)))
+}
+
 /// Classification of a `peer_groups.<name>.channel` reference against the
 /// configured `[channels.*]` blocks. This is the single source of truth for
 /// resolving a raw `channel` string — `Config::validate()` consumes it for
