@@ -3788,8 +3788,10 @@ mod tests {
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
+                multi_message_delay_ms: 800,
                 debounce_ms: None,
                 per_user_session: true,
+                passive_group_context: false,
             },
         );
         config.peer_groups.insert(
