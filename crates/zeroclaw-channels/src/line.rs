@@ -2203,6 +2203,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn webhook_group_wildcard_peer_still_denies_an_ignored_sender() {
+        // `external_peers = ["*"]` with `ignore = ["Ublocked"]` resolves to
+        // `["*", "!Ublocked"]`. The wildcard must not defeat the deny.
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            "line_test_alias",
+            resolver_from(vec!["*".to_string(), "!Ublocked".to_string()]),
+            0,
+        );
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        post_signed(
+            port,
+            "mysecret",
+            &group_event("Ublocked", "Ggroup1", "run something", "rt1"),
+        )
+        .await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "an ignored sender must be denied even under a wildcard grant"
+        );
+
+        // Control: the wildcard still admits everybody it is not denying.
+        post_signed(
+            port,
+            "mysecret",
+            &group_event("Uanyone", "Ggroup1", "hello", "rt2"),
+        )
+        .await;
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(msg.content, "hello");
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_group_exact_grant_is_shadowed_by_an_ignore() {
+        // `external_peers = ["Ualice"]` with `ignore = ["Ualice"]` resolves to
+        // `["Ualice", "!Ualice"]`, which is a grant that admits nobody.
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            "line_test_alias",
+            resolver_from(vec!["Ualice".to_string(), "!Ualice".to_string()]),
+            0,
+        );
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        post_signed(
+            port,
+            "mysecret",
+            &group_event("Ualice", "Ggroup1", "run something", "rt1"),
+        )
+        .await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "a deny on the same identifier must shadow its own grant"
+        );
+        abort.abort();
+    }
+
+    #[tokio::test]
     async fn webhook_group_does_not_consume_pairing_codes() {
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
